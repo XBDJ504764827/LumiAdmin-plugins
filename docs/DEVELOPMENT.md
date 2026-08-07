@@ -250,10 +250,10 @@ csgo/cfg/sourcemod/cngokz/
 | 依赖 | 用途 | 缺失影响 |
 |------|------|----------|
 | MetaMod:Source + SourceMod 1.11 | 运行环境 | 无法运行 |
-| GOKZ 3.6+ | KZ 核心、计时、录像接口 | core/server 可运行；recordguard/global 无法工作 |
+| RIPExt | HTTP/JSON（server/sync/recordguard） | 上报、封禁轮询、权限检查、异常记录全部失效 |
+| GOKZ 3.6+ | KZ 核心、模式、计时、录像接口 | core/server 可运行；recordguard/global 无法工作 |
 | GlobalAPI 2.x | 全球榜单 | global 无法工作，recordguard 补交失败 |
-| SteamWorks | HTTP 上传（global 封禁同步） | 相应功能降级 |
-| RIPExt | HTTP/JSON（server/sync/recordguard） | 上报与同步失效 |
+| SteamWorks | GlobalAPI 常见环境依赖 | GlobalAPI 部分请求可能不可用 |
 
 ## 9. 开发进度
 
