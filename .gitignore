@@ -5,6 +5,10 @@ addons/sourcemod/plugins/*.smx
 # 部署脚本（含服务器地址等敏感信息，不提交）
 deploy.sh
 
+# 第三方 include 不入库（GOKZ/GlobalAPI/RIPExt 等由 build.sh 或 CI 动态获取）
+addons/sourcemod/scripting/include/*
+!addons/sourcemod/scripting/include/lumiadmin/
+
 # 系统文件
 .DS_Store
 *.swp

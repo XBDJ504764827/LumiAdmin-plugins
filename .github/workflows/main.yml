@@ -84,11 +84,19 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y wget libc6:i386 lib32stdc++6 zip
+          sudo apt-get install -y wget unzip libc6:i386 lib32stdc++6 zip
           mkdir sm
           cd sm
           wget -q -O - "http://sourcemod.net/latest.php?os=linux&version=${{ env.SM_VERSION }}" | tar x -zf -
           cp -r ../addons .
+          # 第三方 include 不入库，编译时动态获取：GOKZ/GlobalAPI/json 等来自 gokz-top-plugins
+          git clone --depth 1 https://github.com/kzcharm/gokz-top-plugins.git /tmp/gokz-top-plugins
+          cp -r /tmp/gokz-top-plugins/addons/sourcemod/scripting/include/* ./addons/sourcemod/scripting/include/
+          # RIPExt include 来自官方 release
+          wget -q -O /tmp/ripext.zip https://github.com/ErikMinekus/sm-ripext/releases/download/1.3.2/sm-ripext-1.3.2-linux.zip
+          unzip -oq /tmp/ripext.zip -d /tmp/ripext
+          cp -r /tmp/ripext/addons/sourcemod/scripting/include/* ./addons/sourcemod/scripting/include/
+          echo "#define GOKZ_VERSION \"${LUMIADMIN_VERSION}\"" > ./addons/sourcemod/scripting/include/gokz/version.inc
           cd ./addons/sourcemod/scripting
           for plugin in core.sp server.sp sync.sp recordguard.sp global.sp; do
             ./spcomp "$plugin"

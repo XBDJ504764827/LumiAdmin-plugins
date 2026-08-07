@@ -81,14 +81,6 @@ public void OnStatusReportIntervalChanged(ConVar convar, const char[] oldValue, 
     StartStatusReportTimer();
 }
 
-void ResetServerTokenMappings()
-{
-    if (g_ServerTokenMap != null)
-    {
-        g_ServerTokenMap.Clear();
-    }
-}
-
 void InvalidatePluginConfigCache()
 {
     g_CachedReportToken[0] = '\0';

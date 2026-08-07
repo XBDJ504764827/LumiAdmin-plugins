@@ -28,7 +28,6 @@
 Database g_SyncDb = null;
 Handle g_SyncTimer = null;
 ConVar g_SyncInterval = null;
-ConVar g_SyncHostPort = null;
 char g_ServerReportToken[MAX_SERVER_TOKEN];
 int g_ServerPort = 0;
 bool g_IsOnline = true;
@@ -63,7 +62,6 @@ public void OnPluginStart()
 {
     g_SyncInterval = CreateConVar("sync_interval", "30.0",
         "离线队列同步间隔（秒）。", _, true, 10.0);
-    g_SyncHostPort = FindConVar("hostport");
     HookConVarChange(g_SyncInterval, OnSyncIntervalChanged);
 
     RegServerCmd("sync_set_token", CommandSetToken,

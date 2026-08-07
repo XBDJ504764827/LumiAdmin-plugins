@@ -24,16 +24,6 @@ public Action Timer_SyncQueue(Handle timer)
     return Plugin_Continue;
 }
 
-bool GetCurrentServerPort(int &port)
-{
-    if (g_SyncHostPort == null)
-    {
-        return false;
-    }
-    port = g_SyncHostPort.IntValue;
-    return port > 0;
-}
-
 /**
  * 解析 API 配置：优先 core 插件 native，降级读取 core.cfg 文件。
  */
