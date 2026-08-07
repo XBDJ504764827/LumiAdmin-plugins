@@ -1,0 +1,7 @@
+# 编译产物与缓存
+addons/sourcemod/plugins/*.smx
+.build/
+
+# 系统文件
+.DS_Store
+*.swp

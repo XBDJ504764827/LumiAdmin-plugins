@@ -1,0 +1,155 @@
+"Phrases"
+{
+	// =====[ 封禁菜单 ]=====
+	"Ban Menu Title"
+	{
+		"en"		"Select a player to ban"
+		"zh"		"选择要封禁的玩家"
+	}
+	"Ban Menu Duration Title"
+	{
+		"en"		"Select ban duration"
+		"zh"		"选择封禁时长"
+	}
+	"Ban Duration Permanent"
+	{
+		"en"		"Permanent"
+		"zh"		"永久"
+	}
+	"Ban Duration 10 Minutes"
+	{
+		"en"		"10 minutes"
+		"zh"		"10 分钟"
+	}
+	"Ban Duration 30 Minutes"
+	{
+		"en"		"30 minutes"
+		"zh"		"30 分钟"
+	}
+	"Ban Duration 1 Hour"
+	{
+		"en"		"1 hour"
+		"zh"		"1 小时"
+	}
+	"Ban Duration 1 Day"
+	{
+		"en"		"1 day"
+		"zh"		"1 天"
+	}
+	"Ban Duration 1 Week"
+	{
+		"en"		"1 week"
+		"zh"		"1 周"
+	}
+	"Ban Menu Reason Title"
+	{
+		"en"		"Select ban reason"
+		"zh"		"选择封禁理由"
+	}
+	"Ban Reason Cheating"
+	{
+		"en"		"Cheating"
+		"zh"		"作弊"
+	}
+	"Ban Reason Malicious Behavior"
+	{
+		"en"		"Malicious behavior"
+		"zh"		"恶意行为"
+	}
+	"Ban Reason Insulting Players"
+	{
+		"en"		"Insulting players"
+		"zh"		"辱骂玩家"
+	}
+	"Ban Reason Custom"
+	{
+		"en"		"Custom reason"
+		"zh"		"自定义理由"
+	}
+	"Ban Reason Cancel Hint"
+	{
+		"en"		"Type your custom ban reason in chat, or type !noreason to cancel."
+		"zh"		"请在聊天输入自定义封禁理由，输入 !noreason 取消。"
+	}
+	"Ban Reason Cancelled"
+	{
+		"en"		"Custom reason cancelled."
+		"zh"		"已取消自定义理由。"
+	}
+	"Ban Target Invalid"
+	{
+		"en"		"Ban target is no longer valid, please select again."
+		"zh"		"封禁目标已失效，请重新选择。"
+	}
+	"Ban Applied"
+	{
+		"en"		"Ban has been applied."
+		"zh"		"封禁已生效。"
+	}
+	"Ban Uploaded Offline"
+	{
+		"en"		"Player is offline, ban record has been uploaded."
+		"zh"		"玩家不在线，封禁记录已上传。"
+	}
+	"Ban Record Created"
+	{
+		"en"		"Ban record created, the player will be kicked on the next poll."
+		"zh"		"封禁记录已创建，玩家将在下次轮询时被踢出。"
+	}
+	"Ban Invalid SteamID"
+	{
+		"en"		"Invalid SteamID: %s"
+		"#format"	"{1:s}"
+		"zh"		"SteamID 无效：%s"
+	}
+	"Ban API Not Configured"
+	{
+		"en"		"API not configured, trying offline queue..."
+		"zh"		"API 未配置，尝试离线队列..."
+	}
+	"Ban Queue Unavailable"
+	{
+		"en"		"Offline queue unavailable, please make sure the sync plugin is loaded."
+		"zh"		"离线队列不可用，请确认 sync 插件已加载。"
+	}
+	"Unban Success"
+	{
+		"en"		"Player unbanned successfully, the ban is also removed on the web panel."
+		"zh"		"成功解封该玩家，后台面板中同步解除封禁。"
+	}
+	"Unban Failed Generic"
+	{
+		"en"		"Unban request failed: %s"
+		"#format"	"{1:s}"
+		"zh"		"解封请求失败：%s"
+	}
+	"Unban Failed Retry"
+	{
+		"en"		"Unban request failed, please try again later."
+		"zh"		"解封请求失败，请稍后重试。"
+	}
+	"Unban Failed HTTP"
+	{
+		"en"		"Unban request failed, HTTP status %d."
+		"#format"	"{1:d}"
+		"zh"		"解封请求失败，HTTP 状态码 %d。"
+	}
+	"Kick Banned Message"
+	{
+		"en"		"You have been banned: %s"
+		"#format"	"{1:s}"
+		"zh"		"你已被封禁：%s"
+	}
+
+	// =====[ 进服权限 ]=====
+	"Access Service Unavailable"
+	{
+		"en"		"Access control service is temporarily unavailable, please try again later."
+		"zh"		"访问控制服务暂时不可用，请稍后再试。"
+	}
+	"Access Whitelist Unconfirmed"
+	{
+		"en"		"Your whitelist status cannot be confirmed, please try again later."
+		"zh"		"你的白名单状态无法确认，请稍后再试。"
+	}
+}

@@ -1,0 +1,177 @@
+name: CI
+
+env:
+  SM_VERSION: "1.11"
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ "*" ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+concurrency:
+  group: release-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "LUMIADMIN_VERSION=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "LUMIADMIN_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          git fetch --tags --force
+          latest_tag="$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          before_sha="${{ github.event.before }}"
+          bump_kind="patch"
+
+          if [[ -n "${before_sha}" ]] && [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]] && git rev-parse -q --verify "${before_sha}^{commit}" >/dev/null; then
+            commit_subjects="$(git log --format=%s "${before_sha}..HEAD")"
+          else
+            commit_subjects="$(git log -1 --format=%s HEAD)"
+          fi
+
+          if printf '%s\n' "${commit_subjects}" | grep -Eq '^feat(\([^)]+\))?(!)?:'; then
+            bump_kind="minor"
+          fi
+
+          if [[ -z "${latest_tag}" ]]; then
+            next_tag="1.0.0"
+          else
+            IFS='.' read -r major minor patch <<< "${latest_tag}"
+            if [[ "${bump_kind}" == "minor" ]]; then
+              next_tag="${major}.$((minor + 1)).0"
+            else
+              next_tag="${major}.${minor}.$((patch + 1))"
+            fi
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${next_tag}" >/dev/null; then
+            echo "Tag ${next_tag} already exists. Re-run after fetching tags or retrying the workflow." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${next_tag}"
+          git push origin "refs/tags/${next_tag}"
+
+          echo "LUMIADMIN_VERSION=${next_tag}" >> "$GITHUB_ENV"
+
+      - name: compile
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y wget libc6:i386 lib32stdc++6 zip
+          mkdir sm
+          cd sm
+          wget -q -O - "http://sourcemod.net/latest.php?os=linux&version=${{ env.SM_VERSION }}" | tar x -zf -
+          cp -r ../addons .
+          cd ./addons/sourcemod/scripting
+          for plugin in core.sp server.sp sync.sp recordguard.sp global.sp; do
+            ./spcomp "$plugin"
+          done
+          cd ../../../../
+          mkdir -p addons/sourcemod/plugins
+          mv sm/addons/sourcemod/scripting/*.smx addons/sourcemod/plugins/
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          full_name="lumiadmin-plugins-${LUMIADMIN_VERSION}"
+          upgrade_name="lumiadmin-plugins-${LUMIADMIN_VERSION}-upgrade"
+
+          mkdir -p dist/full dist/upgrade
+          rsync -av \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'sm/' \
+            --exclude '*.md' \
+            --exclude '*.zip' \
+            --exclude 'addons/sourcemod/scripting/' \
+            --exclude 'docs/' \
+            --exclude 'build.sh' \
+            ./ dist/full/"${full_name}"/
+
+          rsync -av \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'sm/' \
+            --exclude '*.md' \
+            --exclude '*.zip' \
+            --exclude 'cfg/' \
+            --exclude 'addons/sourcemod/scripting/' \
+            --exclude 'docs/' \
+            --exclude 'build.sh' \
+            ./ dist/upgrade/"${upgrade_name}"/
+
+          cd dist/full
+          zip -r "../${full_name}.zip" "${full_name}"
+          cd ../upgrade
+          zip -r "../${upgrade_name}.zip" "${upgrade_name}"
+
+      - name: upload-full
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumiadmin-plugins-${{ env.LUMIADMIN_VERSION }}
+          path: |
+            .
+            !sm*
+            !.github*
+            !.git*
+            !*.md
+            !addons/sourcemod/scripting*
+            !*.zip
+            !docs*
+            !build.sh
+
+      - name: upload-upgrade
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumiadmin-plugins-${{ env.LUMIADMIN_VERSION }}-upgrade
+          path: |
+            .
+            !sm*
+            !.github*
+            !.git*
+            !*.md
+            !addons/sourcemod/scripting*
+            !cfg*
+            !*.zip
+            !docs*
+            !build.sh
+
+      - name: publish-release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.LUMIADMIN_VERSION }}
+          name: ${{ env.LUMIADMIN_VERSION }}
+          generate_release_notes: true
+          files: |
+            dist/lumiadmin-plugins-${{ env.LUMIADMIN_VERSION }}.zip
+            dist/lumiadmin-plugins-${{ env.LUMIADMIN_VERSION }}-upgrade.zip
