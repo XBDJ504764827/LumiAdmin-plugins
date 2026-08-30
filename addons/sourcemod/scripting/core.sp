@@ -23,7 +23,7 @@ bool g_CoreHasCachedReportToken = false;
 public Plugin myinfo =
 {
     name = "LumiAdmin Core",
-    author = "LumiAdmin",
+    author = "XBDJ504764827",
     description = "Shared LumiAdmin configuration: API base URL and server port->token mapping.",
     version = CORE_VERSION,
     url = ""
