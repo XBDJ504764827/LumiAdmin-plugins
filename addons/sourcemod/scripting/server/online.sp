@@ -65,7 +65,11 @@ JSONObject BuildReportPayload(const char[] reportToken)
         char steamId64[64];
         char playerIp[64];
         GetClientName(client, player, sizeof(player));
-        GetClientAuthId(client, AuthId_SteamID64, steamId64, sizeof(steamId64), true);
+        // L4：未授权客户端跳过，避免空 steamid 上报
+        if (!GetClientAuthId(client, AuthId_SteamID64, steamId64, sizeof(steamId64), true) || steamId64[0] == '\0')
+        {
+            continue;
+        }
         GetClientIP(client, playerIp, sizeof(playerIp), true);
 
         JSONObject entry = new JSONObject();

@@ -15,6 +15,7 @@
 #include <ripext>
 #include <lumiadmin/core>
 #include <lumiadmin/config_parse>
+#include <lumiadmin/api_client>
 #include <lumiadmin/session_reasons>
 
 #pragma newdecls required
@@ -26,19 +27,30 @@ native bool Sync_IsOnline();
 native int Sync_GetPendingCount();
 
 #define DEFAULT_REPORT_INTERVAL "5.0"
-#define DEFAULT_ACCESS_SNAPSHOT_INTERVAL "300.0"
+#define DEFAULT_ACCESS_SNAPSHOT_INTERVAL "30.0"
 #define DEFAULT_STATUS_REPORT_INTERVAL "30.0"
 #define DEFAULT_DEBUG_LOG "0"
 #define DEFAULT_ACCESS_FAIL_OPEN "1"
+#define DEFAULT_ACCESS_CHECK_TIMEOUT "5.0"
+#define DEFAULT_ACCESS_BREAKER_CONSECUTIVE_FAILURES "3"
+#define DEFAULT_ACCESS_BREAKER_COOLDOWN "120"
+#define DEFAULT_AUTH_EVENTS_INTERVAL "25.0"
+#define AUTH_SNAPSHOT_VERSION_GAP 500
 #define ACCESS_SNAPSHOT_DB "lumiadmin_access_snapshot"
 #define MAX_SERVER_TOKEN 256
 #define MAX_BAN_POLL_ETAG 96
+#define MAX_ACCESS_SNAPSHOT_ETAG 128
+#define MAX_AUTH_EVENT_ID 64
 
 ConVar g_ReportInterval;
 ConVar g_AccessSnapshotInterval;
 ConVar g_StatusReportInterval;
 ConVar g_DebugLog;
 ConVar g_AccessFailOpen;
+ConVar g_AccessCheckTimeout;
+ConVar g_AccessBreakerEnabled;
+ConVar g_AccessBreakerConsecutiveFailures;
+ConVar g_AccessBreakerCooldown;
 ConVar g_CpuUsageCvar;
 ConVar g_HostPortCvar = null;
 ConVar g_TickrateCvar = null;
@@ -46,6 +58,7 @@ Handle g_ReportTimer = null;
 Handle g_BanPollTimer = null;
 Handle g_AccessSnapshotTimer = null;
 Handle g_StatusReportTimer = null;
+Handle g_AccessBreakerCooldownTimer = null;
 Database g_AccessSnapshotDb = null;
 StringMap g_ServerTokenMap = null;
 char g_CachedReportToken[MAX_SERVER_TOKEN];
@@ -63,8 +76,26 @@ int g_UnbanAdminUserId = 0;
 char g_DisconnectReason[MAXPLAYERS + 1][32];
 char g_DisconnectDetail[MAXPLAYERS + 1][256];
 
+// 快照增量同步与退避状态
+char g_AccessSnapshotEtag[MAX_ACCESS_SNAPSHOT_ETAG];
+int g_AccessSnapshotBackoffStep = 0;
+int g_AccessSnapshotNextRetry = 0;
+int g_AccessSnapshotLastRefreshOk = 0;
+
+// ban poll 失败退避状态（L10）
+int g_BanPollBackoffStep = 0;
+
 // 封禁轮询版本签名 etag
 char g_BanPollEtag[MAX_BAN_POLL_ETAG];
+
+// LumiAuth 事件同步状态（Data Plane）：last_applied_version 持久化在 metadata 表
+ConVar g_AuthEventsInterval;
+Handle g_AuthEventsTimer = null;
+bool g_AuthConnected = false;
+bool g_AuthEventsInFlight = false;
+int g_AuthLastAppliedVersion = 0;
+int g_AuthBackoffStep = 0;
+int g_AuthLastOk = 0;
 
 public Plugin myinfo =
 {
@@ -81,6 +112,7 @@ public Plugin myinfo =
 #include "server/online.sp"
 #include "server/bans.sp"
 #include "server/access.sp"
+#include "server/auth_sync.sp"
 
 public void OnPluginStart()
 {
@@ -98,6 +130,7 @@ public void OnMapStart()
     StartBanPollTimer();
     StartAccessSnapshotTimer();
     StartStatusReportTimer();
+    AuthSync_Start();
 }
 
 public void OnMapEnd()
@@ -106,6 +139,7 @@ public void OnMapEnd()
     StopBanPollTimer();
     StopAccessSnapshotTimer();
     StopStatusReportTimer();
+    AuthSync_Stop();
 }
 
 public void OnClientDisconnect(int client)
@@ -113,6 +147,7 @@ public void OnClientDisconnect(int client)
     ReportClientDisconnect(client);
     ClearClientDisconnectReason(client);
     g_WaitingOwnReason[client] = false;
+    // H5：存的是 userid，槽位复用不再串人；清零防陈旧值
     g_BanTarget[client] = 0;
     g_BanTime[client] = 0;
 }
@@ -129,6 +164,11 @@ public void OnPluginEnd()
     StopAccessSnapshotTimer();
     StopStatusReportTimer();
 
+    if (g_AccessBreakerCooldownTimer != null)
+    {
+        delete g_AccessBreakerCooldownTimer;
+        g_AccessBreakerCooldownTimer = null;
+    }
     if (g_AccessSnapshotDb != null)
     {
         delete g_AccessSnapshotDb;

@@ -100,7 +100,7 @@ bool GetApiConfig(char[] apiBaseUrl, int apiMaxLen, char[] token, int tokenMaxLe
         char fileBase[512];
         char fileToken[MAX_TOKEN_LENGTH];
         int filePort = 0;
-        if (ReadCoreConfigFile(fileBase, sizeof(fileBase), filePort, fileToken, sizeof(fileToken)))
+        if (LumiReadCoreConfigCached(fileBase, sizeof(fileBase), filePort, fileToken, sizeof(fileToken)))
         {
             strcopy(apiBaseUrl, apiMaxLen, fileBase);
             strcopy(token, tokenMaxLen, fileToken);

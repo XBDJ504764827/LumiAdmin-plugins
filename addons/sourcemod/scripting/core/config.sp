@@ -28,7 +28,21 @@ bool GetCurrentReportToken(char[] token, int maxLen)
     IntToString(currentPort, portKey, sizeof(portKey));
     if (g_CoreServerTokenMap == null || !g_CoreServerTokenMap.GetString(portKey, token, maxLen))
     {
-        LogError("LumiAdmin Core: no report token found for port %d. Add a mapping in cfg/sourcemod/lumiadmin/core.cfg: core_server \"%d\" \"<token>\"", currentPort, currentPort);
+        // 尚无 token：触发自动识别（异步，不阻塞当前调用），同时提示管理员
+        if (g_CoreAutoIdentify != null && g_CoreAutoIdentify.BoolValue)
+        {
+            Core_RequestIdentify(0.0);
+            int now = GetTime();
+            if (now - g_CoreLastNoTokenLog >= 60)
+            {
+                g_CoreLastNoTokenLog = now;
+                LogMessage("LumiAdmin Core: no report token for port %d yet; auto-identify requested (see core_identity.cfg).", currentPort);
+            }
+        }
+        else
+        {
+            LogError("LumiAdmin Core: no report token found for port %d. Add a mapping in cfg/sourcemod/lumiadmin/core.cfg: core_server \"%d\" \"<token>\"", currentPort, currentPort);
+        }
         return false;
     }
 
@@ -65,6 +79,7 @@ public Action CommandServerMapping(int args)
     }
 
     RegisterServerTokenMapping(port, token);
+    Core_MarkStaticPort(port);
     InvalidateTokenCache();
     return Plugin_Handled;
 }

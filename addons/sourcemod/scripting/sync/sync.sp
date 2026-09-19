@@ -45,7 +45,7 @@ bool GetApiConfig(char[] apiBaseUrl, int apiMaxLen, char[] token, int tokenMaxLe
         char fileBase[512];
         char fileToken[MAX_SERVER_TOKEN];
         int filePort = 0;
-        if (ReadCoreConfigFile(fileBase, sizeof(fileBase), filePort, fileToken, sizeof(fileToken)))
+        if (LumiReadCoreConfigCached(fileBase, sizeof(fileBase), filePort, fileToken, sizeof(fileToken)))
         {
             strcopy(apiBaseUrl, apiMaxLen, fileBase);
             strcopy(token, tokenMaxLen, fileToken);
@@ -217,6 +217,7 @@ void SyncOfflineQueue()
     g_SyncInFlight = true;
     request.Post(jsonPayload, OnSyncResponse, ids);
     delete jsonPayload;
+    delete request;
 }
 
 public void OnSyncResponse(HTTPResponse response, any value, const char[] error)
@@ -260,6 +261,7 @@ public void OnSyncResponse(HTTPResponse response, any value, const char[] error)
     if (data == null)
     {
         delete ids;
+        UpdatePendingCount();
         return;
     }
 
@@ -268,12 +270,53 @@ public void OnSyncResponse(HTTPResponse response, any value, const char[] error)
 
     LogMessage("[LumiAdmin Sync] Sync complete: applied=%d, skipped=%d", applied, skipped);
 
+    // M1：按服务端逐条结果分别标记；服务端返回 results 缺失时退回全量标 synced
+    JSONArray results = view_as<JSONArray>(data.Get("results"));
+    if (results == null)
+    {
+        MarkOperationSynced(ids);
+        delete data;
+        delete ids;
+        UpdatePendingCount();
+        return;
+    }
+
+    ArrayList skippedIds = new ArrayList();
     for (int i = 0; i < ids.Length; i++)
     {
         int id = ids.Get(i);
-        MarkOperationSynced(id);
+        bool failed = false;
+        if (i < results.Length)
+        {
+            JSONObject result = view_as<JSONObject>(results.Get(i));
+            if (result != null)
+            {
+                // applied=成功；skipped=重复提交（幂等，视为已应用）；failed=被拒绝
+                char resultStatus[32];
+                result.GetString("status", resultStatus, sizeof(resultStatus));
+                if (StrEqual(resultStatus, "failed") || result.GetBool("rejected"))
+                {
+                    char reason[128];
+                    result.GetString("error", reason, sizeof(reason));
+                    ArrayList single = new ArrayList();
+                    single.Push(id);
+                    MarkOperationsFailed(single, reason);
+                    delete single;
+                    failed = true;
+                }
+                delete result;
+            }
+        }
+        if (!failed)
+        {
+            skippedIds.Push(id);
+        }
     }
+    delete results;
 
+    // skipped 视为已应用（幂等去重），与 applied 一并标记 synced
+    MarkOperationSynced(skippedIds);
+    delete skippedIds;
     delete data;
     delete ids;
 

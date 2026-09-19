@@ -55,6 +55,11 @@ int GetFinishes(int client, int mode, int timeType)
 // Note: This only gets 128 tick records
 void UpdatePoints(int client, bool force = false, int mode = -1)
 {
+	if (client <= 0 || client > MaxClients)
+	{
+		return;
+	}
+
 	if (requestsInProgress[client] != 0)
 	{
 		return;
@@ -107,13 +112,14 @@ static void UpdatePointsCallback(JSON_Object ranks, GlobalAPIRequestData request
 	int timeType = dp.ReadCell();
 	bool isTotal = dp.ReadCell();
 	delete dp;
-	
-	requestsInProgress[client]--;
-	
+
+	// L6：先判 client==0 再动计数，防止槽位复用把计数打成负数、UpdatePoints 永久阻塞
 	if (client == 0)
 	{
 		return;
 	}
+
+	requestsInProgress[client]--;
 	
 	int points, totalFinishes;
 	if (GlobalAPIRequestFailed(request, "UpdatePointsCallback")
@@ -136,7 +142,8 @@ static void UpdatePointsCallback(JSON_Object ranks, GlobalAPIRequestData request
 		{
 			APIPlayerRank rank = view_as<APIPlayerRank>(rank_object);
 			// points = timeType == TimeType_Nub ? rank.PointsOverall : rank.Points;
-			points = points == -1 ? 0 : rank.Points;
+			// M4：修复未初始化变量（原写法 points 恒为 0）
+			points = rank.Points == -1 ? 0 : rank.Points;
 			totalFinishes = rank.Finishes == -1 ? 0 : rank.Finishes;
 		}
 	}

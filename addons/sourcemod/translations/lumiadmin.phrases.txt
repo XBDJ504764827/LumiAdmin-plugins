@@ -152,4 +152,9 @@
 		"en"		"Your whitelist status cannot be confirmed, please try again later."
 		"zh"		"你的白名单状态无法确认，请稍后再试。"
 	}
+	"Access Offline Mode"
+	{
+		"en"		"Access control is running in offline mode, your access follows the local policy snapshot."
+		"zh"		"访问控制正处于离线模式，你的进入资格按本地策略快照判定。"
+	}
 }

@@ -38,3 +38,15 @@ public int Native_IsDebugEnabled(Handle plugin, int numParams)
 {
     return (g_CoreDebugLog != null && g_CoreDebugLog.BoolValue) ? 1 : 0;
 }
+
+public int Native_GetServerId(Handle plugin, int numParams)
+{
+    int maxLen = GetNativeCell(2);
+    if (g_CoreServerId[0] == '\0')
+    {
+        SetNativeString(1, "", maxLen);
+        return 0;
+    }
+    SetNativeString(1, g_CoreServerId, maxLen);
+    return 1;
+}
