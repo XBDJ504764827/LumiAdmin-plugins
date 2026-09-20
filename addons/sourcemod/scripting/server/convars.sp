@@ -11,7 +11,17 @@ void Server_OnPluginStart()
     g_DebugLog = CreateConVar("server_debug", DEFAULT_DEBUG_LOG,
         "启用 server 插件调试日志。", _, true, 0.0, true, 1.0);
     g_AccessFailOpen = CreateConVar("server_access_fail_open", DEFAULT_ACCESS_FAIL_OPEN,
-        "LumiAdmin 权限 API 与本地快照不可用时是否放行玩家。", _, true, 0.0, true, 1.0);
+        "本地快照完全不可用（无法裁决）时是否放行玩家。", _, true, 0.0, true, 1.0);
+    g_AccessCheckTimeout = CreateConVar("server_access_check_timeout", DEFAULT_ACCESS_CHECK_TIMEOUT,
+        "在线复核/快照刷新请求超时（秒）。", _, true, 2.0, true, 30.0);
+    g_AccessBreakerEnabled = CreateConVar("server_access_breaker_enabled", "1",
+        "在线检查熔断器总开关：连续失败达到阈值后跳过在线检查，以本地快照兜底。", _, true, 0.0, true, 1.0);
+    g_AccessBreakerConsecutiveFailures = CreateConVar("server_access_breaker_consecutive_failures", DEFAULT_ACCESS_BREAKER_CONSECUTIVE_FAILURES,
+        "连续 HTTP 失败/响应异常次数达到该值即熔断。", _, true, 1.0, true, 20.0);
+    g_AccessBreakerCooldown = CreateConVar("server_access_breaker_cooldown", DEFAULT_ACCESS_BREAKER_COOLDOWN,
+        "熔断 OPEN 后等待多少秒进入 HALF_OPEN 试探。", _, true, 10.0, true, 3600.0);
+    g_AuthEventsInterval = CreateConVar("server_auth_events_interval", DEFAULT_AUTH_EVENTS_INTERVAL,
+        "授权事件 Long-Poll 间隔（秒，插件侧看门狗周期；后端 hold≤20s）。", _, true, 5.0, true, 120.0);
 
     // sys_cpu_usage: SourceMod 内置 CPU 使用率 ConVar
     g_CpuUsageCvar = FindConVar("sys_cpu_usage");
@@ -29,6 +39,19 @@ void Server_OnPluginStart()
     RegAdminCmd("sm_unban", CommandUnban, ADMFLAG_UNBAN, "sm_unban <steamid|ip> [reason]");
     RegServerCmd("server_set_token", CommandServerMapping,
         "设置服务器 report token（fallback：server_set_token <port> <token>）。");
+    RegAdminCmd("sm_lumi_access_status", CommandAccessStatus, ADMFLAG_GENERIC,
+        "查看 LumiAdmin 进服权限子系统状态（快照年龄/熔断状态/最近事件）。");
+    RegAdminCmd("sm_lumi_auth_status", CommandAuthStatus, ADMFLAG_GENERIC,
+        "查看 LumiAdmin 授权事件同步状态（连接/版本/待同步）。");
+    RegServerCmd("lumiadmin_refresh_snapshot", CommandRefreshSnapshot,
+        "手动触发权限快照立即刷新（应急/接收面板推送）。");
+    // RCON 快车道（后端封禁落地后经 RCON 下发）：先写本地 Ban 再 Kick，保证重连即拦。
+    RegServerCmd("lumiadmin_apply_ban", CommandApplyBanFastPath,
+        "授权快车道：lumiadmin_apply_ban <ban_id> <version> <steam_id> <expires_unix|0> <reason>");
+    RegServerCmd("lumiadmin_apply_unban", CommandApplyUnbanFastPath,
+        "授权快车道：lumiadmin_apply_unban <ban_id> <version> <steam_id>");
+    RegServerCmd("lumiadmin_auth_resync", CommandAuthResync,
+        "手动触发授权事件补偿（resync / snapshot）。");
     AddCommandListener(ChatHook, "say");
     AddCommandListener(ChatHook, "say_team");
     AddCommandListener(CommandKickListener, "sm_kick");
@@ -46,6 +69,7 @@ void Server_OnPluginStart()
     StartBanPollTimer();
     StartAccessSnapshotTimer();
     StartStatusReportTimer();
+    AuthSync_Start();
 }
 
 void EnsureConfigDirectory()
@@ -107,6 +131,15 @@ bool ShouldLogPluginConfigState(int state, int port, int entryIndex = -1)
     g_LastPluginConfigPort = port;
     g_LastPluginConfigEntryIndex = entryIndex;
     return true;
+}
+
+Action CommandRefreshSnapshot(int args)
+{
+    g_AccessSnapshotNextRetry = 0;
+    g_AccessSnapshotBackoffStep = 0;
+    RequestAccessSnapshotRefresh(true);
+    LogMessage("[LumiAdmin-Access] manual snapshot refresh requested (sm console).");
+    return Plugin_Handled;
 }
 
 Action CommandServerMapping(int args)

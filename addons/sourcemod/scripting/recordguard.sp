@@ -18,6 +18,7 @@
 #include <gokz/kzplayer>
 #include <lumiadmin/core>
 #include <lumiadmin/config_parse>
+#include <lumiadmin/api_client>
 #include <lumiadmin/recordguard>
 
 #pragma newdecls required

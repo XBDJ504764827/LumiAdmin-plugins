@@ -32,6 +32,7 @@ void UpdatePendingCount()
 {
     if (g_SyncDb == null) return;
 
+    // M8：唯一计数来源，其余位置一律调用本函数
     DBResultSet results = SQL_Query(g_SyncDb, "SELECT COUNT(*) FROM offline_queue WHERE status = 'pending' AND retry_count < %d", MAX_RETRY_COUNT);
     if (results != null)
     {
@@ -49,7 +50,11 @@ void CleanupStaleRecords()
 
     int cutoff = GetTime() - CLEANUP_RETENTION_SECONDS;
 
-    char query[256];
+    // H3：达到 MAX_RETRY 的死行先终态化为 failed（保留数据可人工重放），过期后一并清理
+    char query[512];
+    Format(query, sizeof(query), "UPDATE offline_queue SET status = 'failed', sync_error = 'max retries exceeded' WHERE status = 'pending' AND retry_count >= %d", MAX_RETRY_COUNT);
+    SQL_FastQuery(g_SyncDb, query);
+
     Format(query, sizeof(query), "DELETE FROM offline_queue WHERE status IN ('synced', 'failed') AND created_at < %d", cutoff);
     SQL_FastQuery(g_SyncDb, query);
 
@@ -115,110 +120,173 @@ int EnqueueOperation(
         return -1;
     }
 
-    char escapedTarget[256];
-    char escapedPlayerName[256];
-    char escapedReason[512];
-    char escapedOperatorName[256];
-    char escapedOperatorSteamid[256];
-    char escapedIdempotencyKey[MAX_IDEMPOTENCY_KEY];
-
-    EscapeSqlString(g_SyncDb, target, escapedTarget, sizeof(escapedTarget));
-    EscapeSqlString(g_SyncDb, playerName, escapedPlayerName, sizeof(escapedPlayerName));
-    EscapeSqlString(g_SyncDb, reason, escapedReason, sizeof(escapedReason));
-    EscapeSqlString(g_SyncDb, operatorName, escapedOperatorName, sizeof(escapedOperatorName));
-    EscapeSqlString(g_SyncDb, operatorSteamid, escapedOperatorSteamid, sizeof(escapedOperatorSteamid));
-    EscapeSqlString(g_SyncDb, idempotencyKey, escapedIdempotencyKey, sizeof(escapedIdempotencyKey));
-
-    char query[2048];
-    char portBuf[16];
-    char timeBuf[16];
-    SafeIntToString(g_ServerPort, portBuf, sizeof(portBuf));
-    SafeIntToString(GetTime(), timeBuf, sizeof(timeBuf));
-
-    Format(query, sizeof(query), "INSERT INTO offline_queue (operation, target, target_type, player_name, reason, duration_minutes, operator_name, operator_steamid, server_port, created_at, status, idempotency_key) VALUES ('%s', '%s', '%s', '%s', '%s', %d, '%s', '%s', %s, %s, 'pending', '%s')", operation, escapedTarget, targetType, escapedPlayerName, escapedReason, durationMinutes, escapedOperatorName, escapedOperatorSteamid, portBuf, timeBuf, escapedIdempotencyKey);
-
-    if (!ExecuteSql(g_SyncDb, query, "enqueue operation"))
+    // H3：软上限，超限拒收并告警
+    if (g_PendingCount >= SYNC_QUEUE_SOFT_LIMIT)
     {
+        LogError("[LumiAdmin Sync] EnqueueOperation rejected: pending queue reached soft limit (%d). Check API connectivity.", g_PendingCount);
         return -1;
     }
 
-    int opId = 0;
-    DBResultSet results = SQL_Query(g_SyncDb, "SELECT last_insert_rowid()");
-    if (results != null)
+    // M9：reason/player_name 等用户可控长文本改用 SQL_PrepareQuery 参数绑定，
+    // 避免转义串在 buffer 截断中间导致 SQL 语法错误
+    char stmtError[256];
+    DBStatement stmt = SQL_PrepareQuery(g_SyncDb, "INSERT INTO offline_queue (operation, target, target_type, player_name, reason, duration_minutes, operator_name, operator_steamid, server_port, created_at, status, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)", stmtError, sizeof(stmtError));
+    if (stmt == null)
     {
-        if (SQL_FetchRow(results))
-        {
-            opId = SQL_FetchInt(results, 0);
-        }
-        delete results;
+        LogError("[LumiAdmin Sync] failed to prepare enqueue statement: %s", stmtError);
+        return -1;
     }
+
+    stmt.BindString(0, operation, false);
+    stmt.BindString(1, target, false);
+    stmt.BindString(2, targetType, false);
+    stmt.BindString(3, playerName, false);
+    stmt.BindString(4, reason, false);
+    stmt.BindInt(5, durationMinutes);
+    stmt.BindString(6, operatorName, false);
+    stmt.BindString(7, operatorSteamid, false);
+    stmt.BindInt(8, g_ServerPort);
+    stmt.BindInt(9, GetTime());
+    stmt.BindString(10, idempotencyKey, false);
+
+    if (!SQL_Execute(stmt))
+    {
+        LogError("[LumiAdmin Sync] enqueue insert failed.");
+        delete stmt;
+        return -1;
+    }
+    delete stmt;
 
     WriteLocalAuditLog(operation, target, operatorName, operatorSteamid, true, "Enqueued for offline sync");
 
-    g_PendingCount++;
+    // H4：不再同步查询 last_insert_rowid()；opId 仅用于日志，调用方不依赖精确值
+    // M8：不再手动 ++，统一由 UpdatePendingCount 维护
+    UpdatePendingCount();
 
-    // 立即尝试同步（离线时会自动重试）
-    SyncOfflineQueue();
+    // H4：入队后 0.5s 延迟触发同步，把 SQL 开销挪出玩家命令路径
+    KickSyncQueueDeferred();
 
-    return opId;
+    return 0;
 }
 
-void MarkOperationSynced(int id)
+/**
+ * H4：延迟一次性 timer 触发同步，重复入队不叠加。
+ */
+void KickSyncQueueDeferred()
 {
-    if (g_SyncDb == null) return;
-    if (id < 0) return;
+    if (g_SyncKickTimer != null)
+    {
+        return;
+    }
+    g_SyncKickTimer = CreateTimer(0.5, Timer_SyncKickDeferred);
+}
+
+public Action Timer_SyncKickDeferred(Handle timer)
+{
+    g_SyncKickTimer = null;
+    SyncOfflineQueue();
+    return Plugin_Stop;
+}
+
+/**
+ * H3：把 failed 行重置回 pending 手动重放（sm_lumi_sync_retry）。
+ */
+public Action CommandRetryFailed(int client, int args)
+{
+    if (g_SyncDb == null)
+    {
+        ReplyToCommand(client, "[LumiAdmin Sync] database unavailable.");
+        return Plugin_Handled;
+    }
 
     char query[256];
-    char timeBuf[16];
+    Format(query, sizeof(query), "UPDATE offline_queue SET status = 'pending', retry_count = 0, sync_error = '' WHERE status = 'failed'");
+    SQL_FastQuery(g_SyncDb, query);
+    int affected = SQL_GetAffectedRows(g_SyncDb);
+    ReplyToCommand(client, "[LumiAdmin Sync] %d failed operation(s) reset to pending.", affected);
+
+    UpdatePendingCount();
+    if (affected > 0)
+    {
+        SyncOfflineQueue();
+    }
+    return Plugin_Handled;
+}
+
+/**
+ * H4：批量标记，单条 UPDATE ... WHERE id IN (...) 取代逐条 UPDATE。
+ */
+bool MarkOperationsByIds(ArrayList ids, const char[] statusClause, const char[] error)
+{
+    if (g_SyncDb == null || ids == null || ids.Length == 0)
+    {
+        return false;
+    }
+
+    char idList[2048];
+    idList[0] = '\0';
     char idBuf[16];
+    for (int i = 0; i < ids.Length; i++)
+    {
+        int id = ids.Get(i);
+        if (id < 0) continue;
+        IntToString(id, idBuf, sizeof(idBuf));
+        if (idList[0] != '\0')
+        {
+            StrCat(idList, sizeof(idList), ",");
+        }
+        StrCat(idList, sizeof(idList), idBuf);
+    }
+
+    if (idList[0] == '\0')
+    {
+        return false;
+    }
+
+    char escapedError[256];
+    escapedError[0] = '\0';
+    if (error[0] != '\0')
+    {
+        EscapeSqlString(g_SyncDb, error, escapedError, sizeof(escapedError));
+    }
+
+    char timeBuf[16];
     SafeIntToString(GetTime(), timeBuf, sizeof(timeBuf));
-    SafeIntToString(id, idBuf, sizeof(idBuf));
-    Format(query, sizeof(query), "UPDATE offline_queue SET status = 'synced', synced_at = %s WHERE id = %s", timeBuf, idBuf);
-    ExecuteSql(g_SyncDb, query, "mark operation synced");
+
+    char query[2600];
+    if (error[0] != '\0')
+    {
+        Format(query, sizeof(query), "UPDATE offline_queue SET %s, sync_error = '%s' WHERE id IN (%s)", statusClause, escapedError, idList);
+    }
+    else
+    {
+        Format(query, sizeof(query), "UPDATE offline_queue SET %s WHERE id IN (%s)", statusClause, idList);
+    }
+
+    ExecuteSql(g_SyncDb, query, "mark operations by ids");
+    UpdatePendingCount();
+    return true;
+}
+
+void MarkOperationSynced(ArrayList ids)
+{
+    if (g_SyncDb == null) return;
+
+    char timeBuf[16];
+    SafeIntToString(GetTime(), timeBuf, sizeof(timeBuf));
+    char clause[64];
+    Format(clause, sizeof(clause), "status = 'synced', synced_at = %s", timeBuf);
+    MarkOperationsByIds(ids, clause, "");
 }
 
 void MarkOperationsFailed(ArrayList ids, const char[] error)
 {
-    if (g_SyncDb == null) return;
-
-    char escapedError[256];
-    EscapeSqlString(g_SyncDb, error, escapedError, sizeof(escapedError));
-
-    for (int i = 0; i < ids.Length; i++)
-    {
-        int id = ids.Get(i);
-        if (id < 0) continue;
-
-        char query[512];
-        char idBuf[16];
-        SafeIntToString(id, idBuf, sizeof(idBuf));
-        Format(query, sizeof(query), "UPDATE offline_queue SET status = 'failed', sync_error = '%s' WHERE id = %s", escapedError, idBuf);
-        ExecuteSql(g_SyncDb, query, "mark operations failed");
-    }
-
-    UpdatePendingCount();
+    MarkOperationsByIds(ids, "status = 'failed'", error);
 }
 
 void MarkOperationsRetryable(ArrayList ids, const char[] error)
 {
-    if (g_SyncDb == null) return;
-
-    char escapedError[256];
-    EscapeSqlString(g_SyncDb, error, escapedError, sizeof(escapedError));
-
-    for (int i = 0; i < ids.Length; i++)
-    {
-        int id = ids.Get(i);
-        if (id < 0) continue;
-
-        char query[512];
-        char idBuf[16];
-        SafeIntToString(id, idBuf, sizeof(idBuf));
-        Format(query, sizeof(query), "UPDATE offline_queue SET status = 'pending', sync_error = '%s', retry_count = retry_count + 1 WHERE id = %s", escapedError, idBuf);
-        ExecuteSql(g_SyncDb, query, "mark operations retryable");
-    }
-
-    UpdatePendingCount();
+    MarkOperationsByIds(ids, "status = 'pending', retry_count = retry_count + 1", error);
 }
 
 public int Native_EnqueueOperation(Handle plugin, int numParams)
@@ -231,13 +299,18 @@ public int Native_EnqueueOperation(Handle plugin, int numParams)
     char operatorName[128];
     char operatorSteamid[64];
 
-    GetNativeString(1, operation, sizeof(operation));
-    GetNativeString(2, target, sizeof(target));
-    GetNativeString(3, targetType, sizeof(targetType));
-    GetNativeString(4, playerName, sizeof(playerName));
-    GetNativeString(5, reason, sizeof(reason));
-    GetNativeString(6, operatorName, sizeof(operatorName));
-    GetNativeString(7, operatorSteamid, sizeof(operatorSteamid));
+    // L13：GetNativeString 失败时中止，避免使用未初始化/截断数据
+    if (GetNativeString(1, operation, sizeof(operation)) != SP_ERROR_NONE
+        || GetNativeString(2, target, sizeof(target)) != SP_ERROR_NONE
+        || GetNativeString(3, targetType, sizeof(targetType)) != SP_ERROR_NONE
+        || GetNativeString(4, playerName, sizeof(playerName)) != SP_ERROR_NONE
+        || GetNativeString(5, reason, sizeof(reason)) != SP_ERROR_NONE
+        || GetNativeString(6, operatorName, sizeof(operatorName)) != SP_ERROR_NONE
+        || GetNativeString(7, operatorSteamid, sizeof(operatorSteamid)) != SP_ERROR_NONE)
+    {
+        ThrowNativeError(SP_ERROR_NATIVE, "Invalid parameters passed to Sync_EnqueueOperation.");
+        return -1;
+    }
     int durationMinutes = GetNativeCell(8);
 
     return EnqueueOperation(operation, target, targetType, playerName, reason, durationMinutes, operatorName, operatorSteamid);

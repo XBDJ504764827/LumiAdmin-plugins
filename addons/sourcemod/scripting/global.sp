@@ -158,6 +158,8 @@ public void OnLibraryRemoved(const char[] name)
 
 Action IntegrityChecks(Handle timer)
 {
+	// M5：改为进服 15s 首查 + 60s 低频复检，作弊者中途改 fps_max 最多 60s 后被发现，
+	// convar 查询从每秒 2×N 次降为约 N 次/分钟
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		if (IsValidClient(client) && !IsFakeClient(client))
@@ -167,12 +169,18 @@ Action IntegrityChecks(Handle timer)
 		}
 	}
 
+	return Plugin_Handled;
+}
+
+Action PluginScanChecks(Handle timer)
+{
+	// M5：插件扫描开销大且结果几乎不变，改为 OnMapStart 执行一次
 	for (int i = 0; i < BANNEDPLUGINCOMMAND_COUNT; i++)
 	{
 		if (CommandExists(gC_BannedPluginCommands[i]))
 		{
 			Handle bannedIterator = GetPluginIterator();
-			char pluginName[128]; 
+			char pluginName[128];
 			bool foundPlugin = false;
 			while (MorePlugins(bannedIterator))
 			{
@@ -203,7 +211,7 @@ Action IntegrityChecks(Handle timer)
 			delete bannedIterator;
 		}
 	}
-	
+
 	return Plugin_Handled;
 }
 
@@ -264,6 +272,23 @@ public void OnClientPutInServer(int client)
 	gB_GloballyVerified[client] = false;
 	gB_waitingForFPSKick[client] = false;
 	OnClientPutInServer_PrintRecords(client);
+
+	// M5：进服后 15s 首查（避开连接期 convar 查询失败），之后走 60s 复检
+	if (!IsFakeClient(client))
+	{
+		CreateTimer(15.0, Timer_FirstIntegrityCheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+	}
+}
+
+public Action Timer_FirstIntegrityCheck(Handle timer, int userid)
+{
+	int client = GetClientOfUserId(userid);
+	if (IsValidClient(client) && !IsFakeClient(client))
+	{
+		QueryClientConVar(client, "fps_max", FPSCheck, client);
+		QueryClientConVar(client, "m_yaw", MYAWCheck, client);
+	}
+	return Plugin_Handled;
 }
 
 // OnClientAuthorized is apparently too early
@@ -375,16 +400,18 @@ public void OnMapStart()
 	{
 		GlobalAPI_OnInitialized();
 	}
-	
-	// Setup a timer to monitor server/client integrity
-	CreateTimer(1.0, IntegrityChecks, INVALID_HANDLE, TIMER_FLAG_NO_MAPCHANGE | TIMER_REPEAT);
+
+	// M5：完整性检查降频为 60s 复检；插件扫描改 map start 一次
+	CreateTimer(60.0, IntegrityChecks, INVALID_HANDLE, TIMER_FLAG_NO_MAPCHANGE | TIMER_REPEAT);
+	CreateTimer(10.0, PluginScanChecks, INVALID_HANDLE, TIMER_FLAG_NO_MAPCHANGE);
 }
 
 public void OnMapEnd()
 {
 	// So it doesn't get carried over to the next map
 	gI_MapID = -1;
-	for (int client = 1; client < MaxClients; client++)
+	// M6：off-by-one，末槽玩家也要清理
+	for (int client = 1; client <= MaxClients; client++)
 	{
 		ResetMapPoints(client);
 	}
@@ -652,33 +679,24 @@ static void SetupAPI()
 	}
 }
 
+// L14：统一用 GlobalAPI 库的 request.Failure / 空响应判定，替代过时的 IsValidHandle 探测
 bool GlobalAPIRequestFailed(GlobalAPIRequestData request, const char[] context)
 {
-	if (!IsValidHandle(view_as<Handle>(request)))
+	if (request.Failure)
 	{
-		LogError("%s returned invalid GlobalAPI request data handle.", context);
+		LogError("%s request failed.", context);
 		return true;
 	}
-
 	return false;
 }
 
 bool GlobalAPIResponseInvalid(JSON_Object response, const char[] context)
 {
-	if (!IsValidHandle(view_as<Handle>(response)))
+	if (response == null)
 	{
 		LogError("%s returned invalid GlobalAPI response handle.", context);
 		return true;
 	}
-
-#if defined _metastringmap_included
-	Handle data = response.Meta.GetHandle("data");
-	if (!IsValidHandle(data))
-	{
-		LogError("%s returned GlobalAPI response without readable JSON data.", context);
-		return true;
-	}
-#endif
 
 	return false;
 }

@@ -190,6 +190,9 @@ public int DisplayMapTopSubmenuCallback(JSON_Object top, GlobalAPIRequestData re
 	
 	if (MapTopSubmenuAddItems(menu, top, timeType) == 0)
 	{  // If no records found
+		// M7：空分支重开上级菜单，当前 menu 必须释放
+		delete menu;
+
 		if (timeType == TimeType_Pro)
 		{
 			GOKZ_PrintToChat(client, true, "%t", "No Global Times Found (PRO)");

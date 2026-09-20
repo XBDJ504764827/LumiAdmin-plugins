@@ -53,18 +53,28 @@ public int PrintRecordsCallback(JSON_Object records, GlobalAPIRequestData reques
 	int client = GetClientOfUserId(dp.ReadCell());
 	int timeType = dp.ReadCell();
 	delete dp;
-	
-	if (GlobalAPIRequestFailed(request, "PrintRecordsCallback") || GlobalAPIResponseInvalid(records, "PrintRecordsCallback"))
+
+	// L14：统一用库接口判定失败/响应无效
+	if (request.Failure)
 	{
 		LogError("Failed to retrieve record from the Global API for printing.");
+		// H7：失败路径必须复位状态，否则该玩家 sm_gr/sm_gpb 永久 "Please Wait"
+		ResetPrintRecordsState(client);
 		return 0;
 	}
-	
+
 	if (!IsValidClient(client))
 	{
 		return 0;
 	}
-	
+
+	if (records == null)
+	{
+		LogError("Global API returned no readable data for record printing.");
+		ResetPrintRecordsState(client);
+		return 0;
+	}
+
 	if (records.Length <= 0)
 	{
 		printRecordsTimeExists[client][timeType] = false;
@@ -72,7 +82,7 @@ public int PrintRecordsCallback(JSON_Object records, GlobalAPIRequestData reques
 	else
 	{
 		JSON_Object record_object = GlobalAPIArrayGetObject(records, 0);
-		if (GlobalAPIResponseInvalid(record_object, "PrintRecordsCallback record"))
+		if (record_object == null)
 		{
 			printRecordsTimeExists[client][timeType] = false;
 		}
@@ -84,7 +94,7 @@ public int PrintRecordsCallback(JSON_Object records, GlobalAPIRequestData reques
 			record.GetPlayerName(printRecordsPlayerNames[client][timeType], sizeof(printRecordsPlayerNames[][]));
 		}
 	}
-	
+
 	if (!waitingForOtherCallback[client])
 	{
 		if (isPBQuery[client])
@@ -104,6 +114,18 @@ public int PrintRecordsCallback(JSON_Object records, GlobalAPIRequestData reques
 	return 0;
 }
 
+/**
+ * H7：复位玩家查询状态，槽位复用/重连也能从 OnClientPutInServer_PrintRecords 恢复。
+ */
+void ResetPrintRecordsState(int client)
+{
+	if (IsValidClient(client))
+	{
+		inProgress[client] = false;
+		waitingForOtherCallback[client] = false;
+	}
+}
+
 
 
 // =====[ EVENTS ]=====
@@ -111,6 +133,7 @@ public int PrintRecordsCallback(JSON_Object records, GlobalAPIRequestData reques
 void OnClientPutInServer_PrintRecords(int client)
 {
 	inProgress[client] = false;
+	waitingForOtherCallback[client] = false;
 }
 
 

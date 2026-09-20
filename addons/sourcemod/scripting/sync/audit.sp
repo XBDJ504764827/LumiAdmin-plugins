@@ -12,25 +12,27 @@ void WriteLocalAuditLog(
 {
     if (g_SyncDb == null) return;
 
-    char escapedTarget[256];
-    char escapedOperatorName[256];
-    char escapedOperatorSteamid[256];
-    char escapedMessage[512];
+    // M9：operator_steamid/message 等长文本改参数绑定，消除转义截断风险
+    char stmtError[256];
+    DBStatement stmt = SQL_PrepareQuery(g_SyncDb, "INSERT INTO audit_log (operation, target, operator_name, operator_steamid, server_port, success, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", stmtError, sizeof(stmtError));
+    if (stmt == null)
+    {
+        LogError("[LumiAdmin Sync] failed to prepare audit log statement: %s", stmtError);
+        return;
+    }
 
-    EscapeSqlString(g_SyncDb, target, escapedTarget, sizeof(escapedTarget));
-    EscapeSqlString(g_SyncDb, operatorName, escapedOperatorName, sizeof(escapedOperatorName));
-    EscapeSqlString(g_SyncDb, operatorSteamid, escapedOperatorSteamid, sizeof(escapedOperatorSteamid));
-    EscapeSqlString(g_SyncDb, message, escapedMessage, sizeof(escapedMessage));
+    stmt.BindString(0, operation, false);
+    stmt.BindString(1, target, false);
+    stmt.BindString(2, operatorName, false);
+    stmt.BindString(3, operatorSteamid, false);
+    stmt.BindInt(4, g_ServerPort);
+    stmt.BindInt(5, success ? 1 : 0);
+    stmt.BindString(6, message, false);
+    stmt.BindInt(7, GetTime());
 
-    char query[1024];
-    char portBuf[16];
-    char timeBuf[16];
-    char successBuf[8];
-    SafeIntToString(g_ServerPort, portBuf, sizeof(portBuf));
-    SafeIntToString(GetTime(), timeBuf, sizeof(timeBuf));
-    SafeIntToString(success ? 1 : 0, successBuf, sizeof(successBuf));
-
-    Format(query, sizeof(query), "INSERT INTO audit_log (operation, target, operator_name, operator_steamid, server_port, success, message, created_at) VALUES ('%s', '%s', '%s', '%s', %s, %s, '%s', %s)", operation, escapedTarget, escapedOperatorName, escapedOperatorSteamid, portBuf, successBuf, escapedMessage, timeBuf);
-
-    ExecuteSql(g_SyncDb, query, "local audit log");
+    if (!SQL_Execute(stmt))
+    {
+        LogError("[LumiAdmin Sync] audit log insert failed.");
+    }
+    delete stmt;
 }

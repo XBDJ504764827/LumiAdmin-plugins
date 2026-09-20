@@ -14,6 +14,7 @@
 #include <ripext>
 #include <lumiadmin/core>
 #include <lumiadmin/config_parse>
+#include <lumiadmin/api_client>
 
 #pragma newdecls required
 #pragma semicolon 1
@@ -35,6 +36,11 @@ bool g_SyncInFlight = false;
 int g_PendingCount = 0;
 int g_LastSyncTime = 0;
 int g_OperationSeq = 0;
+
+// H4：SQL 异步化后，入队触发改为延迟一次性 timer，避免命令路径卡顿
+Handle g_SyncKickTimer = null;
+// H3：超过软上限后拒收新操作，防止断网数月队列无限膨胀
+#define SYNC_QUEUE_SOFT_LIMIT 2000
 
 #include "sync/queue.sp"
 #include "sync/audit.sp"
@@ -68,6 +74,7 @@ public void OnPluginStart()
         "设置服务器 report token（fallback：sync_set_token <port> <token>）。");
     RegAdminCmd("sm_sync_status", CommandSyncStatus, ADMFLAG_RCON, "显示离线同步状态。");
     RegAdminCmd("sm_force_sync", CommandForceSync, ADMFLAG_RCON, "强制同步离线队列。");
+    RegAdminCmd("sm_lumi_sync_retry", CommandRetryFailed, ADMFLAG_RCON, "把 failed 状态的离线队列行重置回 pending 手动重放。");
 
     ResolveSyncConfig();
     InitSyncDb();
@@ -92,6 +99,17 @@ public void OnMapEnd()
 public void OnPluginEnd()
 {
     StopSyncTimer();
+    if (g_SyncKickTimer != null)
+    {
+        delete g_SyncKickTimer;
+        g_SyncKickTimer = null;
+    }
+    // L11：显式释放数据库句柄，与 server 插件风格一致
+    if (g_SyncDb != null)
+    {
+        delete g_SyncDb;
+        g_SyncDb = null;
+    }
 }
 
 public void OnSyncIntervalChanged(ConVar convar, const char[] oldValue, const char[] newValue)

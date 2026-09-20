@@ -48,7 +48,15 @@ public void OnRulesSynced(HTTPResponse response, any value, const char[] error)
         return;
     }
 
+    // L3：类型校验，返回非数组时按空规则处理
     JSONArray items = view_as<JSONArray>(rawItems);
+    if (items == null)
+    {
+        g_RuleCount = 0;
+        LogError("[lumiadmin-recordguard] rule sync items is not an array.");
+        delete root;
+        return;
+    }
     int count = items.Length;
     if (count > MAX_RULES)
     {

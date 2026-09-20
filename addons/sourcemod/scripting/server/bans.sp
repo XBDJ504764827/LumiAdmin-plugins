@@ -2,12 +2,23 @@
  * 封禁：轮询执行、命令拦截、菜单流程、提交/解封。
  */
 
+// ban poll 独立于上报周期，带失败退避（L10）
 void StartBanPollTimer()
 {
     StopBanPollTimer();
 
-    float interval = g_ReportInterval.FloatValue;
-    g_BanPollTimer = CreateTimer(interval, Timer_PollBans, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+    // 基础间隔 30s，失败按 ×2 退避（30s→60s→120s→…上限 10 分钟），成功复位
+    float base = 30.0;
+    if (g_BanPollBackoffStep > 0)
+    {
+        float backoff = base * float(1 << (g_BanPollBackoffStep > 5 ? 5 : g_BanPollBackoffStep));
+        if (backoff > 600.0)
+        {
+            backoff = 600.0;
+        }
+        base = backoff;
+    }
+    g_BanPollTimer = CreateTimer(base, Timer_PollBans, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
 }
 
 void StopBanPollTimer()
@@ -42,9 +53,7 @@ public Action Timer_PollBans(Handle timer)
         payload.SetString("etag", g_BanPollEtag);
     }
 
-    HTTPRequest request = new HTTPRequest(url);
-    request.Timeout = 10;
-    request.Post(payload, OnBanPollResponse);
+    PostJsonObject(url, payload, OnBanPollResponse);
     delete payload;
 
     return Plugin_Continue;
@@ -54,15 +63,17 @@ public void OnBanPollResponse(HTTPResponse response, any value, const char[] err
 {
     if (error[0] != '\0')
     {
-        LogError("[LumiAdmin Server] ban poll failed: %s", error);
+        BanPollFailed("HTTP error: %s", error);
         return;
     }
 
     if (response.Status != HTTPStatus_OK)
     {
-        LogError("[LumiAdmin Server] ban poll returned HTTP status %d.", response.Status);
+        BanPollFailed("HTTP status %d", "");
         return;
     }
+
+    g_BanPollBackoffStep = 0;
 
     JSONObject data = view_as<JSONObject>(response.Data);
     if (data == null)
@@ -88,6 +99,7 @@ public void OnBanPollResponse(HTTPResponse response, any value, const char[] err
     JSONArray items = view_as<JSONArray>(rawItems);
     if (items == null)
     {
+        LogError("[LumiAdmin Server] ban poll items is not an array.");
         delete data;
         return;
     }
@@ -125,6 +137,19 @@ public void OnBanPollResponse(HTTPResponse response, any value, const char[] err
     delete ipMap;
     delete items;
     delete data;
+}
+
+void BanPollFailed(const char[] cause, const char[] detail)
+{
+    g_BanPollBackoffStep = g_BanPollBackoffStep >= 5 ? 5 : g_BanPollBackoffStep + 1;
+    if (detail[0] != '\0')
+    {
+        LogError("[LumiAdmin Server] ban poll failed (%s): %s. Backing off to %ds.", cause, detail, 30 * (1 << g_BanPollBackoffStep));
+    }
+    else
+    {
+        LogError("[LumiAdmin Server] ban poll failed (%s). Backing off to %ds.", cause, 30 * (1 << g_BanPollBackoffStep));
+    }
 }
 
 void KickMatchingBan(JSONObject item, StringMap steamMap, StringMap ipMap)
@@ -255,6 +280,11 @@ bool SubmitPluginBan(int client, int target, const char[] banType, const char[] 
         strcopy(targetId, sizeof(targetId), ipAddress);
     }
 
+    // 本地兜底落盘（H6）：封禁立即写入本地快照 bans 表，在线提交失败/断网时
+    // 本地行就是唯一记录，离线裁决照样拦截；在线成功后 ban poll 全量回放会覆盖对齐。
+    // ban poll 回放以 (steam_id, expires_at) 幂等去重，不会重复。
+    SaveLocalBanFallback(targetId, banType, reason, duration);
+
     if (!QueueEdgeSyncOperation("ban", targetId, banType, player, reason, adminName, adminSteamid, duration))
     {
         ReplyToCommand(client, "%T", "Ban Queue Unavailable", client);
@@ -313,6 +343,37 @@ JSONObject BuildPluginBanCheckPayload(const char[] token, int port, const char[]
 public void OnPluginBanResponse(HTTPResponse response, any value, const char[] error)
 {
     LogHttpPostFailure("ban submit", response, error);
+}
+
+/**
+ * 本地兜底封禁（H6）：写入快照库 bans 表。
+ * steam 类型同时写 steam_id 列；ip 类型写 ip_address 列，两种都能被 FindOfflineBan 命中。
+ */
+void SaveLocalBanFallback(const char[] targetId, const char[] banType, const char[] reason, int duration)
+{
+    if (g_AccessSnapshotDb == null || targetId[0] == '\0')
+    {
+        return;
+    }
+
+    int expiresAt = duration > 0 ? GetTime() + duration * 60 : 0;
+
+    bool isSteam = StrEqual(banType, "steam");
+    char escapedSteamId[128];
+    char escapedIpAddress[128];
+    char escapedReason[512];
+    SQL_EscapeString(g_AccessSnapshotDb, isSteam ? targetId : "", escapedSteamId, sizeof(escapedSteamId));
+    SQL_EscapeString(g_AccessSnapshotDb, isSteam ? "" : targetId, escapedIpAddress, sizeof(escapedIpAddress));
+    SQL_EscapeString(g_AccessSnapshotDb, reason, escapedReason, sizeof(escapedReason));
+
+    char query[1024];
+    Format(query, sizeof(query), "INSERT INTO bans (steam_id, ip_address, reason, expires_at) VALUES ('%s', '%s', '%s', %d)", escapedSteamId, escapedIpAddress, escapedReason, expiresAt);
+    if (!SQL_FastQuery(g_AccessSnapshotDb, query))
+    {
+        LogError("[LumiAdmin Server] local ban fallback insert failed for target %s.", targetId);
+        return;
+    }
+    LogMessage("[LumiAdmin Server] local ban fallback saved for target %s (expires %d).", targetId, expiresAt);
 }
 
 public void OnPluginUnbanResponse(HTTPResponse response, any value, const char[] error)
@@ -386,6 +447,26 @@ public void OnBanCheckResponse(HTTPResponse response, any value, const char[] er
 
 // =====[ 命令 ]=====
 
+/**
+ * 封禁时长解析（M10）：逐字符校验纯数字，非数字报错而非静默按 0（永久）处理。
+ * "0" 仍表示永久。
+ */
+bool ParseBanDuration(const char[] arg, int &minutes, int client)
+{
+    if (!IsDecimalString(arg) || strlen(arg) == 0 || strlen(arg) > 9)
+    {
+        ReplyToCommand(client, "[LumiAdmin] 封禁时长必须是纯数字分钟数（0=永久），收到: %s", arg);
+        return false;
+    }
+    minutes = StringToInt(arg);
+    if (minutes < 0)
+    {
+        ReplyToCommand(client, "[LumiAdmin] 封禁时长不能为负数。");
+        return false;
+    }
+    return true;
+}
+
 public Action CommandBan(int client, int args)
 {
     if (args == 0 && client > 0)
@@ -437,10 +518,9 @@ public Action CommandBan(int client, int args)
         argIdx++;
     }
 
-    int duration = StringToInt(timeArg);
-    if (duration < 0)
+    int duration;
+    if (!ParseBanDuration(timeArg, duration, client))
     {
-        ReplyToCommand(client, "[LumiAdmin] 封禁时长不能为负数。");
         return Plugin_Handled;
     }
 
@@ -457,7 +537,11 @@ public Action CommandBan(int client, int args)
             char steamId64[64];
             char ipAddress[64];
             char player[128];
-            GetClientAuthId(target, AuthId_SteamID64, steamId64, sizeof(steamId64), true);
+            if (!GetClientAuthId(target, AuthId_SteamID64, steamId64, sizeof(steamId64), true))
+            {
+                ReplyToCommand(client, "[LumiAdmin] 目标玩家尚未完成 Steam 授权，无法封禁。");
+                return Plugin_Handled;
+            }
             GetClientIP(target, ipAddress, sizeof(ipAddress), true);
             GetClientName(target, player, sizeof(player));
             if (SubmitPluginBan(client, target, "steam", steamId64, ipAddress, player, duration, reason))
@@ -509,7 +593,11 @@ public Action CommandBan(int client, int args)
     char steamId[64];
     char ipAddress[64];
     char player[128];
-    GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true);
+    if (!GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        ReplyToCommand(client, "[LumiAdmin] 目标玩家尚未完成 Steam 授权，无法封禁。");
+        return Plugin_Handled;
+    }
     GetClientIP(target, ipAddress, sizeof(ipAddress), true);
     GetClientName(target, player, sizeof(player));
 
@@ -530,10 +618,9 @@ public Action CommandBanIp(int client, int args)
     GetCmdArg(1, targetArg, sizeof(targetArg));
     GetCmdArg(2, timeArg, sizeof(timeArg));
 
-    int duration = StringToInt(timeArg);
-    if (duration < 0)
+    int duration;
+    if (!ParseBanDuration(timeArg, duration, client))
     {
-        ReplyToCommand(client, "[LumiAdmin] 封禁时长不能为负数。");
         return Plugin_Handled;
     }
 
@@ -546,12 +633,21 @@ public Action CommandBanIp(int client, int args)
     int target = FindTarget(client, targetArg, true, false);
     if (target > 0)
     {
-        GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true);
+        if (!GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true))
+        {
+            steamId[0] = '\0';
+        }
         GetClientIP(target, ipAddress, sizeof(ipAddress), true);
         GetClientName(target, player, sizeof(player));
     }
     else
     {
+        // 非玩家目标必须是合法 IP（L5）
+        if (!IsIpAddressTarget(targetArg))
+        {
+            ReplyToCommand(client, "[LumiAdmin] sm_banip 目标必须是玩家或合法 IP 地址，收到: %s", targetArg);
+            return Plugin_Handled;
+        }
         strcopy(ipAddress, sizeof(ipAddress), targetArg);
     }
 
@@ -587,10 +683,9 @@ public Action CommandAddBan(int client, int args)
         strcopy(steamId, sizeof(steamId), part);
     }
 
-    int duration = StringToInt(timeArg);
-    if (duration < 0)
+    int duration;
+    if (!ParseBanDuration(timeArg, duration, client))
     {
-        ReplyToCommand(client, "[LumiAdmin] 封禁时长不能为负数。");
         return Plugin_Handled;
     }
 
@@ -733,12 +828,9 @@ public int MenuHandler_BanTarget(Menu menu, MenuAction action, int client, int i
     {
         char userid[16];
         menu.GetItem(item, userid, sizeof(userid));
-        int target = GetClientOfUserId(StringToInt(userid));
-        if (target > 0)
-        {
-            g_BanTarget[client] = target;
-            DisplayBanTimeMenu(client);
-        }
+        // H5：存 userid 而非 client index，防止菜单间隔期间槽位复用封错人
+        g_BanTarget[client] = StringToInt(userid);
+        DisplayBanTimeMenu(client);
     }
 
     return 0;
@@ -782,11 +874,35 @@ void DisplayBanReasonMenu(int client)
     Menu menu = new Menu(MenuHandler_BanReason);
     menu.SetTitle("%T", "Ban Menu Reason Title", client);
     char reasonLabel[64];
-    Format(reasonLabel, sizeof(reasonLabel), "%T", "Ban Reason Cheating", client); menu.AddItem("作弊", reasonLabel);
-    Format(reasonLabel, sizeof(reasonLabel), "%T", "Ban Reason Malicious Behavior", client); menu.AddItem("恶意行为", reasonLabel);
-    Format(reasonLabel, sizeof(reasonLabel), "%T", "Ban Reason Insulting Players", client); menu.AddItem("辱骂玩家", reasonLabel);
+    // L12：info 用稳定 key，展示文案走翻译，改翻译不影响提交值
+    Format(reasonLabel, sizeof(reasonLabel), "%T", "Ban Reason Cheating", client); menu.AddItem("cheat", reasonLabel);
+    Format(reasonLabel, sizeof(reasonLabel), "%T", "Ban Reason Malicious Behavior", client); menu.AddItem("malicious", reasonLabel);
+    Format(reasonLabel, sizeof(reasonLabel), "%T", "Ban Reason Insulting Players", client); menu.AddItem("insult", reasonLabel);
     Format(reasonLabel, sizeof(reasonLabel), "%T", "Ban Reason Custom", client); menu.AddItem("own", reasonLabel);
     menu.Display(client, MENU_TIME_FOREVER);
+}
+
+/**
+ * L12：稳定 key → 提交文案查表。
+ */
+void GetBanReasonForKey(const char[] key, char[] reason, int maxLen)
+{
+    if (StrEqual(key, "cheat"))
+    {
+        strcopy(reason, maxLen, "作弊");
+    }
+    else if (StrEqual(key, "malicious"))
+    {
+        strcopy(reason, maxLen, "恶意行为");
+    }
+    else if (StrEqual(key, "insult"))
+    {
+        strcopy(reason, maxLen, "辱骂玩家");
+    }
+    else
+    {
+        strcopy(reason, maxLen, key);
+    }
 }
 
 public int MenuHandler_BanReason(Menu menu, MenuAction action, int client, int item)
@@ -799,28 +915,37 @@ public int MenuHandler_BanReason(Menu menu, MenuAction action, int client, int i
 
     if (action == MenuAction_Select)
     {
-        char reason[256];
-        menu.GetItem(item, reason, sizeof(reason));
-        if (StrEqual(reason, "own"))
+        char key[64];
+        menu.GetItem(item, key, sizeof(key));
+        if (StrEqual(key, "own"))
         {
             g_WaitingOwnReason[client] = true;
             PrintToChat(client, "%T", "Ban Reason Cancel Hint", client);
             return 0;
         }
 
-        int target = g_BanTarget[client];
-        if (target <= 0)
+        // H5：userid 换算，目标断开即报错终止
+        int target = GetClientOfUserId(g_BanTarget[client]);
+        if (target <= 0 || !IsClientInGame(target))
         {
             PrintToChat(client, "%T", "Ban Target Invalid", client);
+            g_BanTarget[client] = 0;
             return 0;
         }
 
         char steamId[64];
         char ipAddress[64];
         char player[128];
-        GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true);
+        if (!GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true))
+        {
+            PrintToChat(client, "%T", "Ban Target Invalid", client);
+            return 0;
+        }
         GetClientIP(target, ipAddress, sizeof(ipAddress), true);
         GetClientName(target, player, sizeof(player));
+
+        char reason[256];
+        GetBanReasonForKey(key, reason, sizeof(reason));
         SubmitPluginBan(client, target, "steam", steamId, ipAddress, player, g_BanTime[client], reason);
     }
 
@@ -829,17 +954,23 @@ public int MenuHandler_BanReason(Menu menu, MenuAction action, int client, int i
 
 void SubmitMenuBan(int client, const char[] reason)
 {
-    int target = g_BanTarget[client];
-    if (target <= 0)
+    // H5：userid 换算，目标断开即报错终止
+    int target = GetClientOfUserId(g_BanTarget[client]);
+    if (target <= 0 || !IsClientInGame(target))
     {
         PrintToChat(client, "%T", "Ban Target Invalid", client);
+        g_BanTarget[client] = 0;
         return;
     }
 
     char steamId[64];
     char ipAddress[64];
     char player[128];
-    GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true);
+    if (!GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        PrintToChat(client, "%T", "Ban Target Invalid", client);
+        return;
+    }
     GetClientIP(target, ipAddress, sizeof(ipAddress), true);
     GetClientName(target, player, sizeof(player));
     SubmitPluginBan(client, target, "steam", steamId, ipAddress, player, g_BanTime[client], reason);

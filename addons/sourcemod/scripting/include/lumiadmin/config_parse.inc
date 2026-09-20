@@ -86,10 +86,27 @@ stock bool CopyQuotedValue(const char[] line, int firstQuote, char[] value, int 
  */
 stock bool ParseCoreServerMappingLine(const char[] line, int &port, char[] token, int tokenMaxLen)
 {
+    return ParsePortTokenMappingLine(line, "core_server", port, token, tokenMaxLen);
+}
+
+/**
+ * 解析「端口 -> token」配置行（可指定 key，支持 core_server / core_identity）。
+ * 行格式: <key> "port" "token"
+ * 要求 key 之后必须是空白或引号，避免 core_identity 误匹配 core_identity_id。
+ */
+stock bool ParsePortTokenMappingLine(const char[] line, const char[] key, int &port, char[] token, int tokenMaxLen)
+{
     token[0] = '\0';
     port = 0;
 
-    if (StrContains(line, "core_server", false) != 0)
+    int keyLen = strlen(key);
+    if (keyLen <= 0 || strncmp(line, key, keyLen, false) != 0)
+    {
+        return false;
+    }
+
+    int boundary = line[keyLen];
+    if (boundary != '\0' && boundary != ' ' && boundary != '\t' && boundary != '"')
     {
         return false;
     }
@@ -122,6 +139,51 @@ stock bool ParseCoreServerMappingLine(const char[] line, int &port, char[] token
     port = StringToInt(portText);
     TrimString(token);
     return port > 0;
+}
+
+/**
+ * 读取插件自动识别后写入的 core_identity.cfg，补充当前端口对应的 token。
+ * 配置路径: csgo/cfg/sourcemod/lumiadmin/core_identity.cfg
+ */
+stock bool ReadCoreIdentityToken(int currentPort, char[] token, int tokenMaxLen)
+{
+    token[0] = '\0';
+    if (currentPort <= 0)
+    {
+        return false;
+    }
+
+    char path[PLATFORM_MAX_PATH];
+    BuildPath(Path_SM, path, sizeof(path), "../../cfg/sourcemod/lumiadmin/core_identity.cfg");
+
+    File file = OpenFile(path, "r");
+    if (file == null)
+    {
+        return false;
+    }
+
+    bool found = false;
+    char line[512];
+    while (!file.EndOfFile() && file.ReadLine(line, sizeof(line)))
+    {
+        TrimString(line);
+        if (line[0] == '\0' || (line[0] == '/' && line[1] == '/'))
+        {
+            continue;
+        }
+
+        int linePort = 0;
+        char lineToken[CORE_PARSE_MAX_TOKEN];
+        if (ParsePortTokenMappingLine(line, "core_identity", linePort, lineToken, sizeof(lineToken)) && linePort == currentPort)
+        {
+            strcopy(token, tokenMaxLen, lineToken);
+            found = true;
+            break;
+        }
+    }
+
+    delete file;
+    return found;
 }
 
 /**
@@ -182,5 +244,13 @@ stock bool ReadCoreConfigFile(char[] apiBaseUrl, int apiMaxLen, int &port, char[
 
     TrimString(apiBaseUrl);
     TrimString(token);
+
+    // core.cfg 未配置该端口时，回退到插件自识别写入的 core_identity.cfg
+    if (token[0] == '\0' && currentPort > 0)
+    {
+        ReadCoreIdentityToken(currentPort, token, tokenMaxLen);
+        port = token[0] != '\0' ? currentPort : 0;
+    }
+
     return apiBaseUrl[0] != '\0' && port > 0 && token[0] != '\0';
 }

@@ -58,11 +58,11 @@ bool GetCurrentReportToken(char[] token, int maxLen)
         return true;
     }
 
-    // 降级：直接读取 core.cfg 文件（core 插件未加载时）
+    // 降级：直接读取 core.cfg 文件（core 插件未加载时，失败结果 60s 负缓存）
     char fileBase[512];
     char fileToken[MAX_SERVER_TOKEN];
     int filePort = 0;
-    if (ReadCoreConfigFile(fileBase, sizeof(fileBase), filePort, fileToken, sizeof(fileToken)) && filePort == currentPort)
+    if (LumiReadCoreConfigCached(fileBase, sizeof(fileBase), filePort, fileToken, sizeof(fileToken)) && filePort == currentPort)
     {
         strcopy(token, maxLen, fileToken);
         TrimString(token);
@@ -107,28 +107,7 @@ bool GetCurrentReportToken(char[] token, int maxLen)
  */
 bool BuildPluginApiUrl(char[] url, int maxLen, const char[] suffix)
 {
-    url[0] = '\0';
-
-    char baseUrl[512];
-    if (LibraryExists("core"))
-    {
-        Core_GetApiBaseUrl(baseUrl, sizeof(baseUrl));
-    }
-    TrimString(baseUrl);
-
-    if (baseUrl[0] == '\0')
-    {
-        // 降级读 core.cfg 文件
-        char fileBase[512];
-        char fileToken[MAX_SERVER_TOKEN];
-        int filePort = 0;
-        if (ReadCoreConfigFile(fileBase, sizeof(fileBase), filePort, fileToken, sizeof(fileToken)))
-        {
-            strcopy(baseUrl, sizeof(baseUrl), fileBase);
-        }
-    }
-
-    if (baseUrl[0] == '\0')
+    if (!LumiBuildPluginApiUrl(url, maxLen, suffix))
     {
         int currentPort = 0;
         GetCurrentServerPort(currentPort);
@@ -138,14 +117,6 @@ bool BuildPluginApiUrl(char[] url, int maxLen, const char[] suffix)
         }
         return false;
     }
-
-    int len = strlen(baseUrl);
-    while (len > 0 && baseUrl[len - 1] == '/')
-    {
-        baseUrl[--len] = '\0';
-    }
-
-    Format(url, maxLen, "%s/api/plugin%s", baseUrl, suffix);
     return true;
 }
 
@@ -164,7 +135,11 @@ bool ResolvePluginApiConfig(char[] url, int urlMaxLen, const char[] suffix, char
     return true;
 }
 
-bool PostJsonObject(const char[] url, JSONObject payload, HTTPRequestCallback callback, any value = 0)
+/**
+ * 发送 JSON POST 请求。内部负责 HTTPRequest 句柄的释放（防泄漏）。
+ * timeout 取 0 或负值时使用默认 10s。
+ */
+bool PostJsonObject(const char[] url, JSONObject payload, HTTPRequestCallback callback, any value = 0, float timeout = 10.0)
 {
     if (payload == null)
     {
@@ -173,8 +148,9 @@ bool PostJsonObject(const char[] url, JSONObject payload, HTTPRequestCallback ca
     }
 
     HTTPRequest request = new HTTPRequest(url);
-    request.Timeout = 10;
+    request.Timeout = timeout > 0 ? RoundToZero(timeout) : 10;
     request.Post(payload, callback, value);
+    delete request;
     return true;
 }
 
