@@ -258,6 +258,43 @@ void SubmitRecordResultTransient(const char[] recordId, const char[] error)
     delete payload;
 }
 
+/**
+ * M3：上报瞬时错误但不终态化——status 保持待审，站点下个轮询周期重新下发。
+ */
+void SubmitRecordResultTransient(const char[] recordId, const char[] error)
+{
+    if (!IsValidRecordId(recordId))
+    {
+        return;
+    }
+
+    char suffix[160];
+    Format(suffix, sizeof(suffix), "/abnormal-records/%s/submit-result", recordId);
+    HTTPRequest request = CreateJsonRequest(suffix);
+    if (request == null)
+    {
+        return;
+    }
+
+    char apiBaseUrl[MAX_URL_LENGTH];
+    char token[MAX_TOKEN_LENGTH];
+    int port = 0;
+    if (!GetApiConfig(apiBaseUrl, sizeof(apiBaseUrl), token, sizeof(token), port))
+    {
+        delete request;
+        return;
+    }
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", port);
+    payload.SetString("status", "pending");
+    payload.SetString("error", error);
+    request.Post(payload, OnSubmitResultResponse);
+    delete request;
+    delete payload;
+}
+
 public void OnSubmitResultResponse(HTTPResponse response, any value, const char[] error)
 {
     if (error[0] != '\0')
