@@ -100,8 +100,8 @@ public void OnAuthEventsResponse(HTTPResponse response, any value, const char[] 
         return;
     }
 
-    bool snapshotRequired = root.GetBool("snapshot_required");
-    int latestVersion = root.GetInt("latest_version");
+    bool snapshotRequired = LumiJsonGetBool(root, "snapshot_required");
+    int latestVersion = LumiJsonGetInt(root, "latest_version");
 
     if (snapshotRequired || (latestVersion - g_AuthLastAppliedVersion) > AUTH_SNAPSHOT_VERSION_GAP)
     {
@@ -113,7 +113,7 @@ public void OnAuthEventsResponse(HTTPResponse response, any value, const char[] 
         return;
     }
 
-    JSON rawEvents = root.Get("events");
+    JSON rawEvents = LumiJsonGet(root, "events");
     JSONArray events = view_as<JSONArray>(rawEvents);
     if (events == null)
     {
@@ -133,7 +133,7 @@ public void OnAuthEventsResponse(HTTPResponse response, any value, const char[] 
 
         char eventId[MAX_AUTH_EVENT_ID];
         char eventType[64];
-        int version = ev.GetInt("version");
+        int version = LumiJsonGetInt(ev, "version");
         ev.GetString("event_id", eventId, sizeof(eventId));
         ev.GetString("event_type", eventType, sizeof(eventType));
 
@@ -379,8 +379,8 @@ public void OnAuthSnapshotResponse(HTTPResponse response, any value, const char[
         return;
     }
 
-    int latestVersion = root.GetInt("latest_version");
-    JSONObject item = view_as<JSONObject>(root.Get("item"));
+    int latestVersion = LumiJsonGetInt(root, "latest_version");
+    JSONObject item = view_as<JSONObject>(LumiJsonGet(root, "item"));
     if (item == null)
     {
         LogError("[LumiAuth] Snapshot response missed item.");

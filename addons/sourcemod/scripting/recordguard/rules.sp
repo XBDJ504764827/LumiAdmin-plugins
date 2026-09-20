@@ -83,24 +83,24 @@ public void OnRulesSynced(HTTPResponse response, any value, const char[] error)
         TrimString(g_RuleMap[g_RuleCount]);
         LowerString(g_RuleMap[g_RuleCount]);
 
-        g_RuleCourse[g_RuleCount] = item.GetInt("course");
+        g_RuleCourse[g_RuleCount] = LumiJsonGetInt(item, "course");
         g_RuleMode[g_RuleCount][0] = '\0';
         g_RuleTimeType[g_RuleCount][0] = '\0';
 
-        if (!item.IsNull("mode"))
+        if (item.HasKey("mode") && !item.IsNull("mode"))
         {
             item.GetString("mode", g_RuleMode[g_RuleCount], sizeof(g_RuleMode[]));
             TrimString(g_RuleMode[g_RuleCount]);
             LowerString(g_RuleMode[g_RuleCount]);
         }
-        if (!item.IsNull("time_type"))
+        if (item.HasKey("time_type") && !item.IsNull("time_type"))
         {
             item.GetString("time_type", g_RuleTimeType[g_RuleCount], sizeof(g_RuleTimeType[]));
             TrimString(g_RuleTimeType[g_RuleCount]);
             LowerString(g_RuleTimeType[g_RuleCount]);
         }
 
-        g_RuleThreshold[g_RuleCount] = item.GetFloat("threshold_seconds");
+        g_RuleThreshold[g_RuleCount] = LumiJsonGetFloat(item, "threshold_seconds");
         if (g_RuleThreshold[g_RuleCount] <= 0.0)
         {
             delete item;

@@ -265,13 +265,13 @@ public void OnSyncResponse(HTTPResponse response, any value, const char[] error)
         return;
     }
 
-    int applied = data.GetInt("applied");
-    int skipped = data.GetInt("skipped");
+    int applied = LumiJsonGetInt(data, "applied");
+    int skipped = LumiJsonGetInt(data, "skipped");
 
     LogMessage("[LumiAdmin Sync] Sync complete: applied=%d, skipped=%d", applied, skipped);
 
     // M1：按服务端逐条结果分别标记；服务端返回 results 缺失时退回全量标 synced
-    JSONArray results = view_as<JSONArray>(data.Get("results"));
+    JSONArray results = view_as<JSONArray>(LumiJsonGet(data, "results"));
     if (results == null)
     {
         MarkOperationSynced(ids);
@@ -294,7 +294,7 @@ public void OnSyncResponse(HTTPResponse response, any value, const char[] error)
                 // applied=成功；skipped=重复提交（幂等，视为已应用）；failed=被拒绝
                 char resultStatus[32];
                 result.GetString("status", resultStatus, sizeof(resultStatus));
-                if (StrEqual(resultStatus, "failed") || result.GetBool("rejected"))
+                if (StrEqual(resultStatus, "failed") || LumiJsonGetBool(result, "rejected"))
                 {
                     char reason[128];
                     result.GetString("error", reason, sizeof(reason));

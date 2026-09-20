@@ -83,12 +83,12 @@ public void OnBanPollResponse(HTTPResponse response, any value, const char[] err
     }
 
     // 记录服务端返回的版本签名，供下次轮询回传以启用增量检测
-    if (!data.IsNull("etag"))
+    if (data.HasKey("etag") && !data.IsNull("etag"))
     {
         data.GetString("etag", g_BanPollEtag, sizeof(g_BanPollEtag));
     }
 
-    JSON rawItems = data.Get("items");
+    JSON rawItems = LumiJsonGet(data, "items");
     if (rawItems == null)
     {
         LogError("[LumiAdmin Server] ban poll response missing items.");
@@ -158,7 +158,7 @@ void KickMatchingBan(JSONObject item, StringMap steamMap, StringMap ipMap)
     char ipAddress[64];
     char reason[256];
     item.GetString("steam_id", steamId, sizeof(steamId));
-    if (!item.IsNull("ip_address"))
+    if (item.HasKey("ip_address") && !item.IsNull("ip_address"))
     {
         item.GetString("ip_address", ipAddress, sizeof(ipAddress));
     }

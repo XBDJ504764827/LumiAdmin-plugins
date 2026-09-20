@@ -117,10 +117,10 @@ void SubmitApprovedRecord(JSONObject item)
     item.GetString("mode", modeShort, sizeof(modeShort));
     GetGlobalModeNameFromShort(modeShort, modeGlobal, sizeof(modeGlobal));
 
-    int mapId = item.GetInt("map_id");
-    int course = item.GetInt("course");
-    int teleports = item.GetInt("teleports");
-    float runTime = item.GetFloat("run_time_seconds");
+    int mapId = LumiJsonGetInt(item, "map_id");
+    int course = LumiJsonGetInt(item, "course");
+    int teleports = LumiJsonGetInt(item, "teleports");
+    float runTime = LumiJsonGetFloat(item, "run_time_seconds");
 
     if (!IsValidRecordId(recordId) || steamId2[0] == '\0' || mapId <= 0)
     {
