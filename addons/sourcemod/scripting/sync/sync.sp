@@ -215,9 +215,9 @@ void SyncOfflineQueue()
     HTTPRequest request = new HTTPRequest(url);
     request.Timeout = 10;
     g_SyncInFlight = true;
+    // RIPExt 自动释放 request 句柄，只释放 payload
     request.Post(jsonPayload, OnSyncResponse, ids);
     delete jsonPayload;
-    delete request;
 }
 
 public void OnSyncResponse(HTTPResponse response, any value, const char[] error)

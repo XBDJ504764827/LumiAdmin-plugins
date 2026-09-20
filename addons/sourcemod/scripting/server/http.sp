@@ -136,7 +136,9 @@ bool ResolvePluginApiConfig(char[] url, int urlMaxLen, const char[] suffix, char
 }
 
 /**
- * 发送 JSON POST 请求。内部负责 HTTPRequest 句柄的释放（防泄漏）。
+ * 发送 JSON POST 请求。
+ * RIPExt 语义：Post()/Get() 执行后 request 句柄由扩展自动释放，
+ * 此处必须 NOT delete，否则触发 "Handle invalid" 双重释放。
  * timeout 取 0 或负值时使用默认 10s。
  */
 bool PostJsonObject(const char[] url, JSONObject payload, HTTPRequestCallback callback, any value = 0, float timeout = 10.0)
@@ -150,7 +152,7 @@ bool PostJsonObject(const char[] url, JSONObject payload, HTTPRequestCallback ca
     HTTPRequest request = new HTTPRequest(url);
     request.Timeout = timeout > 0 ? RoundToZero(timeout) : 10;
     request.Post(payload, callback, value);
-    delete request;
+    // 注意：不要 delete request（RIPExt 自动释放；delete 会导致 Handle invalid）
     return true;
 }
 

@@ -29,8 +29,8 @@ void PollApprovedRecords()
     payload.SetString("report_token", token);
     payload.SetInt("port", port);
     payload.SetInt("limit", 5);
+    // RIPExt 自动释放 request 句柄，只释放 payload
     request.Post(payload, OnApprovedRecordsPolled);
-    delete request;
     delete payload;
 }
 
@@ -216,8 +216,8 @@ void SubmitRecordResult(const char[] recordId, bool success, int globalRecordId,
     {
         payload.SetString("error", error);
     }
+    // RIPExt 自动释放 request 句柄，只释放 payload
     request.Post(payload, OnSubmitResultResponse);
-    delete request;
     delete payload;
 }
 
@@ -253,8 +253,8 @@ void SubmitRecordResultTransient(const char[] recordId, const char[] error)
     payload.SetInt("port", port);
     payload.SetString("status", "pending");
     payload.SetString("error", error);
+    // RIPExt 自动释放 request 句柄，只释放 payload
     request.Post(payload, OnSubmitResultResponse);
-    delete request;
     delete payload;
 }
 
