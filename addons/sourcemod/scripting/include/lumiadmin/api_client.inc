@@ -75,3 +75,47 @@ stock bool LumiBuildPluginApiUrl(char[] url, int urlMaxLen, const char[] suffix)
     Format(url, urlMaxLen, "%s/api/plugin%s", baseUrl, suffix);
     return true;
 }
+
+/**
+ * RIPExt 安全取值封装：`JSONObject.GetBool/GetInt/GetFloat/Get/IsNull`
+ * 在 key 缺失时会抛 "Could not retrieve value for key" 异常，
+ * 这里统一先用 HasKey 探测，缺失则返回默认值。
+ *
+ * GetString 本身返回 bool 不抛异常，可直接使用。
+ */
+stock bool LumiJsonGetBool(JSONObject obj, const char[] key, bool defaultValue = false)
+{
+    if (obj == null || !obj.HasKey(key) || obj.IsNull(key))
+    {
+        return defaultValue;
+    }
+    return obj.GetBool(key);
+}
+
+stock int LumiJsonGetInt(JSONObject obj, const char[] key, int defaultValue = 0)
+{
+    if (obj == null || !obj.HasKey(key) || obj.IsNull(key))
+    {
+        return defaultValue;
+    }
+    return obj.GetInt(key);
+}
+
+stock float LumiJsonGetFloat(JSONObject obj, const char[] key, float defaultValue = 0.0)
+{
+    if (obj == null || !obj.HasKey(key) || obj.IsNull(key))
+    {
+        return defaultValue;
+    }
+    return obj.GetFloat(key);
+}
+
+/** 安全获取嵌套对象/数组；缺失或类型不符时返回 null（调用方自行判空）。 */
+stock JSON LumiJsonGet(JSONObject obj, const char[] key)
+{
+    if (obj == null || !obj.HasKey(key) || obj.IsNull(key))
+    {
+        return null;
+    }
+    return obj.Get(key);
+}

@@ -391,8 +391,9 @@ public void OnAccessSnapshotResponse(HTTPResponse response, any value, const cha
         return;
     }
 
-    // 后端确认无变化：刷新成功，重置退避
-    if (root.GetBool("unchanged"))
+    // 后端确认无变化：刷新成功，重置退避。
+    // RIPExt 对缺失 key 会抛异常，统一走 LumiJsonGetBool 安全取值。
+    if (LumiJsonGetBool(root, "unchanged"))
     {
         g_AccessSnapshotBackoffStep = 0;
         g_AccessSnapshotLastRefreshOk = GetTime();
@@ -711,8 +712,8 @@ void SaveAccessSnapshot(JSONObject item)
 
     char generatedAtUnix[32];
     char expiresAtUnix[32];
-    IntToString(item.GetInt("generated_at_unix"), generatedAtUnix, sizeof(generatedAtUnix));
-    IntToString(item.GetInt("expires_at_unix"), expiresAtUnix, sizeof(expiresAtUnix));
+    IntToString(LumiJsonGetInt(item, "generated_at_unix"), generatedAtUnix, sizeof(generatedAtUnix));
+    IntToString(LumiJsonGetInt(item, "expires_at_unix"), expiresAtUnix, sizeof(expiresAtUnix));
     if (!InsertMetadata("generated_at_unix", generatedAtUnix)
         || !InsertMetadata("expires_at_unix", expiresAtUnix))
     {
@@ -721,16 +722,16 @@ void SaveAccessSnapshot(JSONObject item)
         return;
     }
 
-    JSONObject server = view_as<JSONObject>(item.Get("server"));
+    JSONObject server = view_as<JSONObject>(LumiJsonGet(item, "server"));
     if (server != null)
     {
         char query[512];
         Format(query, sizeof(query),
             "INSERT INTO server_rules (id, whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level) VALUES (1, %d, %d, %d, %d)",
-            server.GetBool("whitelist_mode_enabled") ? 1 : 0,
-            server.GetBool("access_restriction_enabled") ? 1 : 0,
-            server.GetInt("min_rating"),
-            server.GetInt("min_steam_level"));
+            LumiJsonGetBool(server, "whitelist_mode_enabled") ? 1 : 0,
+            LumiJsonGetBool(server, "access_restriction_enabled") ? 1 : 0,
+            LumiJsonGetInt(server, "min_rating"),
+            LumiJsonGetInt(server, "min_steam_level"));
         if (!SQL_FastQuery(g_AccessSnapshotDb, query))
         {
             LogError("[LumiAdmin-Access] access snapshot: server_rules insert failed, ROLLBACK.");
@@ -828,7 +829,7 @@ bool SaveSnapshotBans(JSONArray bans)
         ban.GetString("steam_id", steamId, sizeof(steamId));
         ban.GetString("ip_address", ipAddress, sizeof(ipAddress));
         ban.GetString("reason", reason, sizeof(reason));
-        IntToString(ban.GetInt("expires_at_unix"), expiresAtUnix, sizeof(expiresAtUnix));
+        IntToString(LumiJsonGetInt(ban, "expires_at_unix"), expiresAtUnix, sizeof(expiresAtUnix));
 
         char escapedSteamId[128];
         char escapedIpAddress[128];
@@ -907,9 +908,9 @@ bool SaveSnapshotAccessProfiles(JSONArray profiles)
         Format(query, sizeof(query),
             "INSERT OR REPLACE INTO access_profiles (steam_id, rating, steam_level, expires_at) VALUES ('%s', %d, %d, %d)",
             escapedSteamId,
-            profile.GetInt("rating"),
-            profile.GetInt("steam_level"),
-            profile.GetInt("expires_at_unix"));
+            LumiJsonGetInt(profile, "rating"),
+            LumiJsonGetInt(profile, "steam_level"),
+            LumiJsonGetInt(profile, "expires_at_unix"));
         if (!SQL_FastQuery(g_AccessSnapshotDb, query))
         {
             LogError("[LumiAdmin-Access] access snapshot: access_profiles insert failed at index %d", i);
