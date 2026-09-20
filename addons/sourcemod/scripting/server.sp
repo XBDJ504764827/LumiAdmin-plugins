@@ -32,8 +32,6 @@ native int Sync_GetPendingCount();
 #define DEFAULT_DEBUG_LOG "0"
 #define DEFAULT_ACCESS_FAIL_OPEN "1"
 #define DEFAULT_ACCESS_CHECK_TIMEOUT "5.0"
-#define DEFAULT_ACCESS_BREAKER_CONSECUTIVE_FAILURES "3"
-#define DEFAULT_ACCESS_BREAKER_COOLDOWN "120"
 #define DEFAULT_AUTH_EVENTS_INTERVAL "25.0"
 #define AUTH_SNAPSHOT_VERSION_GAP 500
 #define ACCESS_SNAPSHOT_DB "lumiadmin_access_snapshot"
@@ -48,9 +46,6 @@ ConVar g_StatusReportInterval;
 ConVar g_DebugLog;
 ConVar g_AccessFailOpen;
 ConVar g_AccessCheckTimeout;
-ConVar g_AccessBreakerEnabled;
-ConVar g_AccessBreakerConsecutiveFailures;
-ConVar g_AccessBreakerCooldown;
 ConVar g_CpuUsageCvar;
 ConVar g_HostPortCvar = null;
 ConVar g_TickrateCvar = null;
@@ -58,7 +53,6 @@ Handle g_ReportTimer = null;
 Handle g_BanPollTimer = null;
 Handle g_AccessSnapshotTimer = null;
 Handle g_StatusReportTimer = null;
-Handle g_AccessBreakerCooldownTimer = null;
 Database g_AccessSnapshotDb = null;
 StringMap g_ServerTokenMap = null;
 char g_CachedReportToken[MAX_SERVER_TOKEN];
@@ -164,11 +158,6 @@ public void OnPluginEnd()
     StopAccessSnapshotTimer();
     StopStatusReportTimer();
 
-    if (g_AccessBreakerCooldownTimer != null)
-    {
-        delete g_AccessBreakerCooldownTimer;
-        g_AccessBreakerCooldownTimer = null;
-    }
     if (g_AccessSnapshotDb != null)
     {
         delete g_AccessSnapshotDb;

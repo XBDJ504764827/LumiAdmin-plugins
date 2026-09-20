@@ -2,7 +2,7 @@
  * HTTP 与 API 配置解析工具。
  */
 
-void DebugLog(const char[] format, any ...)
+stock void DebugLog(const char[] format, any ...)
 {
     if (g_DebugLog == null || !g_DebugLog.BoolValue)
     {
