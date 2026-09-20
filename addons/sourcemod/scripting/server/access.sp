@@ -12,17 +12,6 @@
 #define ACCESS_STATUS_RECENT_MAX 10
 #define ACCESS_CONFIG_ERROR_LOG_INTERVAL 600
 
-// =====[ 熔断器状态 ]=====
-enum struct AccessBreaker
-{
-    int state;              // 0=CLOSED 1=OPEN 2=HALF_OPEN
-    int consecutiveHttpFailures;
-    int openedAt;           // 进入 OPEN 的时间，0=未在 OPEN
-}
-
-AccessBreaker g_AccessBreaker;
-int g_AccessCheckInFlight = 0;   // HALF_OPEN 探测请求是否已发出
-
 // 最近事件记录（自检命令展示用）
 char g_AccessRecentEvents[ACCESS_STATUS_RECENT_MAX][192];
 int g_AccessRecentEventHead = 0;
@@ -54,51 +43,13 @@ void LocalAccessDecide(int client)
 
 // =====[ 在线复核层（已退役为主链路，仅后台对账保留；进服用 LocalAccessDecide）]=====
 
-// 兼容保留：历史在线检查入口，现直接转本地裁决（不再发起 HTTP，不阻塞进服）。
-void SubmitAccessCheck(int client)
-{
-    LocalAccessFallback(client);
-}
-
-JSONObject BuildPluginAccessCheckPayload(const char[] token, int port, const char[] steamId64, const char[] ipAddress, const char[] player)
-{
-    JSONObject payload = new JSONObject();
-    payload.SetString("report_token", token);
-    payload.SetInt("port", port);
-    payload.SetInt("server_port", port);
-    payload.SetString("steam_id64", steamId64);
-    payload.SetString("ip_address", ipAddress);
-    payload.SetString("player", player);
-    return payload;
-}
-
-public void OnAccessCheckResponse(HTTPResponse response, any value, const char[] error)
-{
-    // 在线复核已退役：历史回调残留保护，直接按本地兜底处理（不再信任在线踢人）。
-    LocalAccessFallbackByUserId(value);
-}
-
-bool IsBanRelatedRejection(const char[] failureCode, const char[] accessMethod)
-{
-    return StrEqual(failureCode, "banned")
-        || StrEqual(failureCode, "linked_ip_banned")
-        || StrEqual(accessMethod, "banned");
-}
+// 在线复核层已退役：历史入口/回调/载荷构造全部删除。
+// 进服只走 LocalAccessDecide；后台对账走 auth_sync 事件 + 补偿快照。
 
 // =====[ 本地快照兜底 ]=====
 
-void LocalAccessFallbackByUserId(any userId)
-{
-    int client = GetClientOfUserId(userId);
-    if (client <= 0 || !IsClientConnected(client) || IsFakeClient(client))
-    {
-        return;
-    }
-    LocalAccessFallback(client);
-}
-
 /**
- * 本地兜底裁决：仅在在线层不可用（熔断/失败/配置缺失）时执行。
+ * 本地裁决：进服主链路（同步，零网络等待，grace=0）。
  * 快照「陈旧但可用」：过期只告警，不作为放行或踢人依据。
  */
 void LocalAccessFallback(int client)
@@ -322,121 +273,7 @@ bool OfflineProfileMeetsRequirement(const char[] steamId, int minRating, int min
     return meets;
 }
 
-// =====[ 熔断器 ]=====
-
-bool AccessBreakerEnabled()
-{
-    return g_AccessBreakerEnabled == null || g_AccessBreakerEnabled.BoolValue;
-}
-
-bool AccessBreakerAllowsRequest()
-{
-    if (!AccessBreakerEnabled())
-    {
-        return true;
-    }
-
-    if (g_AccessBreaker.state == 1)
-    {
-        // OPEN 期间完全跳过在线层
-        return false;
-    }
-
-    if (g_AccessBreaker.state == 2 && g_AccessCheckInFlight != 0)
-    {
-        return false;
-    }
-
-    return true;
-}
-
-void AccessBreakerOnSuccess()
-{
-    if (g_AccessBreaker.state == 2)
-    {
-        g_AccessCheckInFlight = 0;
-        AccessBreakerTransition(0, "probe succeeded");
-    }
-    g_AccessBreaker.consecutiveHttpFailures = 0;
-}
-
-void AccessBreakerOnFailure()
-{
-    if (g_AccessBreaker.state == 2)
-    {
-        g_AccessCheckInFlight = 0;
-        AccessBreakerTransition(1, "probe failed");
-        return;
-    }
-
-    g_AccessBreaker.consecutiveHttpFailures++;
-    if (g_AccessBreaker.consecutiveHttpFailures >= g_AccessBreakerConsecutiveFailures.IntValue)
-    {
-        AccessBreakerTrip("consecutive http failures");
-        g_AccessBreaker.consecutiveHttpFailures = 0;
-    }
-}
-
-void AccessBreakerTrip(const char[] cause)
-{
-    if (g_AccessBreaker.state == 1)
-    {
-        return;
-    }
-    AccessBreakerTransition(1, cause);
-}
-
-void AccessBreakerTransition(int newState, const char[] cause)
-{
-    int oldState = g_AccessBreaker.state;
-    if (oldState == newState)
-    {
-        return;
-    }
-
-    g_AccessBreaker.state = newState;
-    if (newState == 1)
-    {
-        g_AccessBreaker.openedAt = GetTime();
-        g_AccessSnapshotNextRetry = 0; // 熔断即触发一次立即刷新
-        LogError("[LumiAdmin-Access] circuit breaker OPEN (%s): online check disabled, falling back to local snapshot.", cause);
-        LogAccessEvent("breaker", cause);
-        RequestAccessSnapshotRefresh(true);
-        if (g_AccessBreakerCooldownTimer == null)
-        {
-            g_AccessBreakerCooldownTimer = CreateTimer(5.0, Timer_AccessBreakerCooldown, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
-        }
-    }
-    else if (newState == 2)
-    {
-        g_AccessCheckInFlight = 0;
-        LogMessage("[LumiAdmin-Access] circuit breaker HALF_OPEN: probing online check (%s).", cause);
-    }
-    else
-    {
-        g_AccessBreaker.consecutiveHttpFailures = 0;
-        LogMessage("[LumiAdmin-Access] circuit breaker CLOSED: online check restored (%s).", cause);
-    }
-}
-
-public Action Timer_AccessBreakerCooldown(Handle timer)
-{
-    if (g_AccessBreaker.state != 1)
-    {
-        g_AccessBreakerCooldownTimer = null;
-        return Plugin_Stop;
-    }
-
-    int cooldown = g_AccessBreakerCooldown.IntValue;
-    int openedAt = g_AccessBreaker.openedAt;
-    if (openedAt > 0 && GetTime() - openedAt >= cooldown)
-    {
-        g_AccessBreakerCooldownTimer = null;
-        AccessBreakerTransition(2, "cooldown elapsed");
-        return Plugin_Stop;
-    }
-    return Plugin_Continue;
-}
+// =====[ 熔断器（已删除：在线复核层随 LumiAuth 上线退役，后台补偿靠 auth_sync 退避）]=====
 
 // =====[ 快照刷新 ]=====
 
@@ -1139,11 +976,6 @@ Action CommandAccessStatus(int admin, int args)
         g_AccessSnapshotLastRefreshOk > 0 ? GetTime() - g_AccessSnapshotLastRefreshOk : -1);
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot refresh backoff step: %d", g_AccessSnapshotBackoffStep);
 
-    static const char stateNames[][] = { "CLOSED", "OPEN", "HALF_OPEN" };
-    ReplyToCommand(admin, "[LumiAdmin-Access] circuit breaker: %s (enabled=%d)",
-        stateNames[g_AccessBreaker.state],
-        AccessBreakerEnabled() ? 1 : 0);
-    ReplyToCommand(admin, "[LumiAdmin-Access] consecutive http failures: %d", g_AccessBreaker.consecutiveHttpFailures);
     ReplyToCommand(admin, "[LumiAdmin-Access] fail_open: %d check timeout: %.1fs",
         ShouldFailOpenAccessCheck() ? 1 : 0,
         g_AccessCheckTimeout.FloatValue);

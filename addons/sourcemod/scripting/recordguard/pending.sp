@@ -164,8 +164,8 @@ void CreateAbnormalRecord(int client, const char[] modeShort, const char[] timeT
     callbackPack.WriteString(timeTypeName);
     callbackPack.WriteCell(retryIndex);
 
+    // RIPExt 自动释放 request 句柄，只释放 payload
     request.Post(payload, OnCreateAbnormalRecordResponse, callbackPack);
-    delete request;
     delete payload;
 }
 

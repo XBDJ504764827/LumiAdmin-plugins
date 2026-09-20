@@ -227,8 +227,8 @@ bool Core_TryIdentify()
         request.SetHeader("X-Lumi-Install-Key", installKey);
     }
 
+    // RIPExt 自动释放 request 句柄，此处只释放 payload
     request.Post(payload, OnCoreIdentifyResponse, port);
-    delete request;
     delete payload;
 
     g_CoreIdentifyInFlight = true;

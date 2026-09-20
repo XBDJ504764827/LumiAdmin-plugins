@@ -13,13 +13,7 @@ void Server_OnPluginStart()
     g_AccessFailOpen = CreateConVar("server_access_fail_open", DEFAULT_ACCESS_FAIL_OPEN,
         "本地快照完全不可用（无法裁决）时是否放行玩家。", _, true, 0.0, true, 1.0);
     g_AccessCheckTimeout = CreateConVar("server_access_check_timeout", DEFAULT_ACCESS_CHECK_TIMEOUT,
-        "在线复核/快照刷新请求超时（秒）。", _, true, 2.0, true, 30.0);
-    g_AccessBreakerEnabled = CreateConVar("server_access_breaker_enabled", "1",
-        "在线检查熔断器总开关：连续失败达到阈值后跳过在线检查，以本地快照兜底。", _, true, 0.0, true, 1.0);
-    g_AccessBreakerConsecutiveFailures = CreateConVar("server_access_breaker_consecutive_failures", DEFAULT_ACCESS_BREAKER_CONSECUTIVE_FAILURES,
-        "连续 HTTP 失败/响应异常次数达到该值即熔断。", _, true, 1.0, true, 20.0);
-    g_AccessBreakerCooldown = CreateConVar("server_access_breaker_cooldown", DEFAULT_ACCESS_BREAKER_COOLDOWN,
-        "熔断 OPEN 后等待多少秒进入 HALF_OPEN 试探。", _, true, 10.0, true, 3600.0);
+        "快照刷新/补偿请求超时（秒）。", _, true, 2.0, true, 30.0);
     g_AuthEventsInterval = CreateConVar("server_auth_events_interval", DEFAULT_AUTH_EVENTS_INTERVAL,
         "授权事件 Long-Poll 间隔（秒，插件侧看门狗周期；后端 hold≤20s）。", _, true, 5.0, true, 120.0);
 
