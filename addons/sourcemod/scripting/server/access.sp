@@ -124,10 +124,12 @@ void LocalAccessFallback(int client)
     {
         // 明确不满足白名单/门槛：本地自治主链路下直接踢，白名单才真正生效。
         // 这与文件头「命中封禁/白名单缺失/门槛不满足即立即 Kick，grace=0」一致。
+        // 注意：直接用 %s 展示原因，不走 %T 翻译，避免翻译文件未更新时
+        // KickClient 抛异常导致「判定拒绝却没有真正踢出」。
         LogAccessEvent("kick", "rules denied (local snapshot)");
         ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
         MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
-        KickClient(client, "%T", "Access Denied Reason", client, denyReason);
+        KickClient(client, "%s", denyReason);
         return;
     }
 
@@ -805,7 +807,7 @@ void AuthReconcileOnlinePlayers()
             LogAccessEvent("kick", "reconcile: rules denied");
             ReportAccessDecision(client, steamId, ip, false, denyMethod, denyFailureCode, denyReason);
             MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
-            KickClient(client, "%T", "Access Denied Reason", client, denyReason);
+            KickClient(client, "%s", denyReason);
         }
         else if (decision == LocalRule_Unavailable && !ShouldFailOpenAccessCheck())
         {
