@@ -70,11 +70,13 @@ void LocalAccessFallback(int client)
         if (!ShouldFailOpenAccessCheck())
         {
             LogAccessEvent("kick", "snapshot unavailable, fail_closed");
+            ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "snapshot_missing", "访问控制服务暂时不可用。");
             MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "访问控制服务暂时不可用。");
             KickClient(client, "%T", "Access Service Unavailable", client);
             return;
         }
         LogAccessEvent("allow", "snapshot unavailable, fail_open");
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "snapshot unavailable, fail_open");
         RequestAccessSnapshotRefresh(true);
         return;
     }
@@ -83,6 +85,7 @@ void LocalAccessFallback(int client)
     if (hasAuth && FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
     {
         LogAccessEvent("kick", "banned (local snapshot)");
+        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
         MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
         KickClient(client, "%T", "Kick Banned Message", client, reason);
         return;
@@ -94,11 +97,13 @@ void LocalAccessFallback(int client)
         if (SnapshotHasRule("whitelist_mode_enabled") || !ShouldFailOpenAccessCheck())
         {
             LogAccessEvent("kick", "no steamid under whitelist mode (fallback)");
+            ReportAccessDecision(client, steamId, ipAddress, false, "whitelist_rejected", "no_steamid", "无法获取 SteamID。");
             MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "无法获取 SteamID。");
             KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
             return;
         }
         LogAccessEvent("allow", "no steamid, fail_open");
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "no steamid, fail_open");
         return;
     }
 
@@ -107,16 +112,39 @@ void LocalAccessFallback(int client)
         if (!ShouldFailOpenAccessCheck())
         {
             LogAccessEvent("kick", "rules not confirmed, fail_closed (fallback)");
+            ReportAccessDecision(client, steamId, ipAddress, false, "whitelist_rejected", "rules_unconfirmed", "本地访问快照未确认玩家满足进入条件。");
             MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
             KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
             return;
         }
         LogAccessEvent("allow", "rules unconfirmed, fail_open (fallback)");
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "rules unconfirmed, fail_open");
         return;
     }
 
     LogAccessEvent("allow", "local snapshot fallback");
+    char allowMethod[32];
+    LocalAllowAccessMethod(allowMethod, sizeof(allowMethod));
+    ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "local snapshot");
 }
+
+/**
+ * 本地放行时推断进服方式：白名单模式 → whitelist；进入限制 → restriction；
+ * 均未开启 → unrestricted。用于进服监控展示。
+ */
+void LocalAllowAccessMethod(char[] method, int maxLen)
+{
+    strcopy(method, maxLen, "unrestricted");
+    if (SnapshotHasRule("whitelist_mode_enabled"))
+    {
+        strcopy(method, maxLen, "whitelist");
+    }
+    else if (SnapshotHasRule("access_restriction_enabled"))
+    {
+        strcopy(method, maxLen, "restriction");
+    }
+}
+
 
 bool SnapshotHasRule(const char[] column)
 {
@@ -936,6 +964,110 @@ void LogAccessEvent(const char[] kind, const char[] detail)
     {
         g_AccessRecentEventCount++;
     }
+}
+
+/**
+ * 上报本地裁决结果到 LumiAdmin（异步，不阻塞进服）。
+ *
+ * LumiAuth 本地自治后进服不再调用 /access/check，进服监控改由插件主动上报：
+ * POST /api/plugin/access/record，携带 report_token + port + 裁决结果。
+ * 网络失败仅记录日志，绝不影响进服主链路。
+ */
+void ReportAccessDecision(int client, const char[] steamId, const char[] ipAddress, bool allowed, const char[] accessMethod, const char[] failureCode, const char[] rejectReason)
+{
+    if (steamId[0] == '\0')
+    {
+        return;
+    }
+
+    char url[512];
+    char token[256];
+    if (!ResolvePluginApiConfig(url, sizeof(url), "/access/record", token, sizeof(token)))
+    {
+        return;
+    }
+
+    int currentPort = 0;
+    GetCurrentServerPort(currentPort);
+
+    char playerName[128];
+    playerName[0] = '\0';
+    if (client > 0 && IsClientConnected(client))
+    {
+        GetClientName(client, playerName, sizeof(playerName));
+    }
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", currentPort);
+    payload.SetString("steam_id64", steamId);
+    if (ipAddress[0] != '\0')
+    {
+        payload.SetString("ip_address", ipAddress);
+    }
+    if (playerName[0] != '\0')
+    {
+        payload.SetString("player", playerName);
+    }
+    payload.SetBool("allowed", allowed);
+    payload.SetString("access_method", accessMethod);
+    if (failureCode[0] != '\0')
+    {
+        payload.SetString("failure_code", failureCode);
+    }
+    if (rejectReason[0] != '\0')
+    {
+        payload.SetString("reject_reason", rejectReason);
+    }
+
+    int rating = 0;
+    int steamLevel = 0;
+    if (GetOfflineProfileValues(steamId, rating, steamLevel))
+    {
+        payload.SetInt("rating", rating);
+        payload.SetInt("steam_level", steamLevel);
+    }
+
+    PostJsonObject(url, payload, OnAccessRecordResponse, 0, g_AccessCheckTimeout.FloatValue);
+    delete payload;
+}
+
+public void OnAccessRecordResponse(HTTPResponse response, any value, const char[] error)
+{
+    LogHttpPostFailure("access record report", response, error);
+}
+
+/**
+ * 读取本地快照中的玩家 rating / steam_level（用于进服监控展示）。
+ * 无记录时返回 false。
+ */
+bool GetOfflineProfileValues(const char[] steamId, int &rating, int &steamLevel)
+{
+    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
+    {
+        return false;
+    }
+
+    char escapedSteamId[128];
+    char query[256];
+    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
+    Format(query, sizeof(query), "SELECT rating, steam_level FROM access_profiles WHERE steam_id = '%s' LIMIT 1", escapedSteamId);
+
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
+    if (results == null)
+    {
+        return false;
+    }
+
+    bool found = false;
+    if (SQL_FetchRow(results))
+    {
+        rating = SQL_FetchInt(results, 0);
+        steamLevel = SQL_FetchInt(results, 1);
+        found = true;
+    }
+    delete results;
+    return found;
 }
 
 bool ShouldLogAccessConfigError()
