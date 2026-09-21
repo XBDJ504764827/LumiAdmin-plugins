@@ -107,85 +107,155 @@ void LocalAccessFallback(int client)
         return;
     }
 
-    if (!OfflineRulesAllowClient(steamId))
-    {
-        if (!ShouldFailOpenAccessCheck())
-        {
-            LogAccessEvent("kick", "rules not confirmed, fail_closed (fallback)");
-            ReportAccessDecision(client, steamId, ipAddress, false, "whitelist_rejected", "rules_unconfirmed", "本地访问快照未确认玩家满足进入条件。");
-            MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
-            KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
-            return;
-        }
-        LogAccessEvent("allow", "rules unconfirmed, fail_open (fallback)");
-        // 规则未确认说明本地 server_rules 缺失/异常：以无限制上报，但触发一次全量快照补写规则。
-        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
-        RequestAccessSnapshotRefresh(true);
-        return;
-    }
-
-    LogAccessEvent("allow", "local snapshot fallback");
     char allowMethod[32];
-    LocalAllowAccessMethod(steamId, allowMethod, sizeof(allowMethod));
-    ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
+    char denyMethod[32];
+    char denyFailureCode[48];
+    char denyReason[256];
+    LocalRuleDecision decision = OfflineEvaluateRules(steamId, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+
+    if (decision == LocalRule_Allow)
+    {
+        LogAccessEvent("allow", "local snapshot");
+        ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
+        return;
+    }
+
+    if (decision == LocalRule_Deny)
+    {
+        // 明确不满足白名单/门槛：本地自治主链路下直接踢，白名单才真正生效。
+        // 这与文件头「命中封禁/白名单缺失/门槛不满足即立即 Kick，grace=0」一致。
+        LogAccessEvent("kick", "rules denied (local snapshot)");
+        ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
+        KickClient(client, "%T", "Access Denied Reason", client, denyReason);
+        return;
+    }
+
+    // LocalRule_Unavailable：规则表缺失/损坏，无法裁决，按 fail_open 口径处理
+    if (!ShouldFailOpenAccessCheck())
+    {
+        LogAccessEvent("kick", "rules unavailable, fail_closed");
+        ReportAccessDecision(client, steamId, ipAddress, false, "whitelist_rejected", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
+        KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
+        return;
+    }
+    LogAccessEvent("allow", "rules unavailable, fail_open");
+    ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
+    RequestAccessSnapshotRefresh(true);
+    return;
 }
 
 /**
- * 本地放行时推断进服方式，与后端 /access/check 的判定顺序保持一致：
- *   1. 均未开启 → unrestricted
- *   2. 进入限制开启且玩家满足 rating/level → restriction
- *   3. 白名单模式开启且玩家在白名单 → whitelist
- * 结果用于进服监控展示「玩家是靠白名单还是靠满足门槛进入」。
+ * 本地裁决三态结果：
+ *  - LocalRule_Allow        ：满足进服条件（method 给出进服方式）
+ *  - LocalRule_Deny         ：明确不满足（白名单缺失/门槛不足）→ 直接踢，白名单才真正生效
+ *  - LocalRule_Unavailable  ：规则表缺失/损坏，无法裁决 → 由 fail_open 决定放行或踢
+ *
+ * 关键：旧实现把「明确拒绝」和「规则不可用」混为一谈（都返回 false 后按 fail_open
+ * 放行），导致 LumiAuth 本地自治主链路下白名单形同虚设。此枚举区分两者。
  */
-void LocalAllowAccessMethod(const char[] steamId, char[] method, int maxLen)
+enum LocalRuleDecision
 {
-    strcopy(method, maxLen, "unrestricted");
-
-    if (SnapshotHasRule("access_restriction_enabled") && OfflineProfileMeetsRule(steamId))
-    {
-        strcopy(method, maxLen, "restriction");
-        return;
-    }
-    if (SnapshotHasRule("whitelist_mode_enabled") && OfflineWhitelistContains(steamId))
-    {
-        strcopy(method, maxLen, "whitelist");
-        return;
-    }
+    LocalRule_Allow = 0,
+    LocalRule_Deny = 1,
+    LocalRule_Unavailable = 2,
 }
 
 /**
- * 玩家是否满足本地快照中的进入限制（rating / steam level）。
- * 与 OfflineRulesAllowClient 使用同一 server_rules 口径，供进服方式推断复用。
+ * 本地规则裁决（三态）。
+ * allowMethod 在 Allow 时写入进服方式（whitelist / restriction / unrestricted）。
+ * denyMethod / denyFailureCode / denyReason 在 Deny 时写入进服方式与拒绝原因，
+ * 供进服监控展示（如 whitelist_rejected / restriction_rejected）。
  */
-bool OfflineProfileMeetsRule(const char[] steamId)
+LocalRuleDecision OfflineEvaluateRules(
+    const char[] steamId,
+    char[] allowMethod, int methodMaxLen,
+    char[] denyMethod, int denyMethodMaxLen,
+    char[] denyFailureCode, int failMaxLen,
+    char[] denyReason, int reasonMaxLen)
 {
+    allowMethod[0] = '\0';
+    denyMethod[0] = '\0';
+    denyFailureCode[0] = '\0';
+    denyReason[0] = '\0';
+
     if (g_AccessSnapshotDb == null)
     {
-        return false;
+        return LocalRule_Unavailable;
     }
 
-    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT min_rating, min_steam_level FROM server_rules WHERE id = 1");
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level FROM server_rules WHERE id = 1");
     if (results == null)
     {
-        return false;
+        return LocalRule_Unavailable;
     }
 
-    bool meets = false;
-    if (SQL_FetchRow(results))
+    if (!SQL_FetchRow(results))
     {
-        int minRating = SQL_FetchInt(results, 0);
-        int minSteamLevel = SQL_FetchInt(results, 1);
-        if (minRating <= 0 && minSteamLevel <= 0)
-        {
-            meets = true;
-        }
-        else
-        {
-            meets = OfflineProfileMeetsRequirement(steamId, minRating, minSteamLevel);
-        }
+        // 规则表无行：无法裁决（不是玩家不满足）
+        delete results;
+        return LocalRule_Unavailable;
     }
+
+    bool whitelistModeEnabled = SQL_FetchInt(results, 0) != 0;
+    bool accessRestrictionEnabled = SQL_FetchInt(results, 1) != 0;
+    int minRating = SQL_FetchInt(results, 2);
+    int minSteamLevel = SQL_FetchInt(results, 3);
     delete results;
-    return meets;
+
+    bool hasWhitelist = whitelistModeEnabled && OfflineWhitelistContains(steamId);
+    bool meetsRestriction = accessRestrictionEnabled
+        && (minRating <= 0 && minSteamLevel <= 0 ? true : OfflineProfileMeetsRequirement(steamId, minRating, minSteamLevel));
+
+    // 均未开启 → 无限制放行
+    if (!whitelistModeEnabled && !accessRestrictionEnabled)
+    {
+        strcopy(allowMethod, methodMaxLen, "unrestricted");
+        return LocalRule_Allow;
+    }
+
+    // 进入限制优先（与后端 /access/check 顺序一致）
+    if (accessRestrictionEnabled && meetsRestriction)
+    {
+        strcopy(allowMethod, methodMaxLen, "restriction");
+        return LocalRule_Allow;
+    }
+
+    // 白名单放行
+    if (whitelistModeEnabled && hasWhitelist)
+    {
+        strcopy(allowMethod, methodMaxLen, "whitelist");
+        return LocalRule_Allow;
+    }
+
+    // 明确拒绝：按启用模式给出原因与失败码（与后端 access/check 组合一致）
+    if (whitelistModeEnabled && !hasWhitelist && !accessRestrictionEnabled)
+    {
+        strcopy(denyMethod, denyMethodMaxLen, "whitelist_rejected");
+        strcopy(denyFailureCode, failMaxLen, "not_whitelisted");
+        strcopy(denyReason, reasonMaxLen, "你没有该服务器的白名单，请前往网站申请。");
+    }
+    else if (accessRestrictionEnabled && !meetsRestriction && !whitelistModeEnabled)
+    {
+        strcopy(denyMethod, denyMethodMaxLen, "restriction_rejected");
+        strcopy(denyFailureCode, failMaxLen, "restriction_rejected");
+        strcopy(denyReason, reasonMaxLen, "你的资料未达到该服务器的最低进入要求。");
+    }
+    else if (whitelistModeEnabled && !hasWhitelist && accessRestrictionEnabled && !meetsRestriction)
+    {
+        strcopy(denyMethod, denyMethodMaxLen, "restriction_rejected");
+        strcopy(denyFailureCode, failMaxLen, "restriction_rejected");
+        strcopy(denyReason, reasonMaxLen, "你既没有该服务器的白名单，也未达到最低进入要求。");
+    }
+    else
+    {
+        // 组合下至少其一满足即已放行，走到这里说明白名单与门槛均未满足
+        strcopy(denyMethod, denyMethodMaxLen, "restriction_rejected");
+        strcopy(denyFailureCode, failMaxLen, "restriction_rejected");
+        strcopy(denyReason, reasonMaxLen, "你的资料未满足服务器进入要求。");
+    }
+    return LocalRule_Deny;
 }
 
 
@@ -256,45 +326,6 @@ bool FindOfflineBan(const char[] steamId, const char[] ipAddress, char[] reason,
     }
     delete results;
     return found;
-}
-
-bool OfflineRulesAllowClient(const char[] steamId)
-{
-    if (g_AccessSnapshotDb == null)
-    {
-        return false;
-    }
-
-    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level FROM server_rules WHERE id = 1");
-    if (results == null)
-    {
-        return false;
-    }
-
-    bool allowed = false;
-    if (SQL_FetchRow(results))
-    {
-        bool whitelistModeEnabled = SQL_FetchInt(results, 0) != 0;
-        bool accessRestrictionEnabled = SQL_FetchInt(results, 1) != 0;
-        int minRating = SQL_FetchInt(results, 2);
-        int minSteamLevel = SQL_FetchInt(results, 3);
-
-        if (whitelistModeEnabled)
-        {
-            allowed = OfflineWhitelistContains(steamId);
-        }
-        else
-        {
-            allowed = true;
-        }
-
-        if (allowed && accessRestrictionEnabled)
-        {
-            allowed = OfflineProfileMeetsRequirement(steamId, minRating, minSteamLevel);
-        }
-    }
-    delete results;
-    return allowed;
 }
 
 bool OfflineWhitelistContains(const char[] steamId)
@@ -764,14 +795,23 @@ void AuthReconcileOnlinePlayers()
             continue;
         }
 
-        if (!OfflineRulesAllowClient(steamId))
+        char allowMethod[32];
+        char denyMethod[32];
+        char denyFailureCode[48];
+        char denyReason[256];
+        LocalRuleDecision decision = OfflineEvaluateRules(steamId, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+        if (decision == LocalRule_Deny)
         {
-            if (!ShouldFailOpenAccessCheck())
-            {
-                LogAccessEvent("kick", "reconcile: rules unconfirmed");
-                MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
-                KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
-            }
+            LogAccessEvent("kick", "reconcile: rules denied");
+            ReportAccessDecision(client, steamId, ip, false, denyMethod, denyFailureCode, denyReason);
+            MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
+            KickClient(client, "%T", "Access Denied Reason", client, denyReason);
+        }
+        else if (decision == LocalRule_Unavailable && !ShouldFailOpenAccessCheck())
+        {
+            LogAccessEvent("kick", "reconcile: rules unavailable, fail_closed");
+            MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
+            KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
         }
     }
 }
@@ -1201,6 +1241,48 @@ Action CommandAccessStatus(int admin, int args)
     ReplyToCommand(admin, "[LumiAdmin-Access] auth events: last_applied=%d connected=%d",
         g_AuthLastAppliedVersion,
         g_AuthConnected ? 1 : 0);
+
+    // 本地快照表内容诊断（定位「规则缺失 → 全部 fail_open」类问题）
+    if (g_AccessSnapshotDb != null)
+    {
+        ReplyToCommand(admin, "[LumiAdmin-Access] ---- local snapshot tables ----");
+        ReplyToCommand(admin, "[LumiAdmin-Access] server_rules row: %s", LocalServerRulesPresent() ? "present" : "MISSING");
+
+        char ruleText[128];
+        ruleText[0] = '\0';
+        DBResultSet ruleSet = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level FROM server_rules WHERE id = 1");
+        if (ruleSet != null)
+        {
+            if (SQL_FetchRow(ruleSet))
+            {
+                Format(ruleText, sizeof(ruleText), "whitelist=%d restriction=%d min_rating=%d min_level=%d",
+                    SQL_FetchInt(ruleSet, 0), SQL_FetchInt(ruleSet, 1), SQL_FetchInt(ruleSet, 2), SQL_FetchInt(ruleSet, 3));
+            }
+            delete ruleSet;
+        }
+        ReplyToCommand(admin, "[LumiAdmin-Access] rules detail: %s", ruleText[0] != '\0' ? ruleText : "(none)");
+
+        DBResultSet wlCount = SQL_Query(g_AccessSnapshotDb, "SELECT COUNT(*) FROM whitelist");
+        int whitelistTotal = (wlCount != null && SQL_FetchRow(wlCount)) ? SQL_FetchInt(wlCount, 0) : -1;
+        if (wlCount != null)
+        {
+            delete wlCount;
+        }
+        DBResultSet banCount = SQL_Query(g_AccessSnapshotDb, "SELECT COUNT(*) FROM bans");
+        int banTotal = (banCount != null && SQL_FetchRow(banCount)) ? SQL_FetchInt(banCount, 0) : -1;
+        if (banCount != null)
+        {
+            delete banCount;
+        }
+        DBResultSet profileCount = SQL_Query(g_AccessSnapshotDb, "SELECT COUNT(*) FROM access_profiles");
+        int profileTotal = (profileCount != null && SQL_FetchRow(profileCount)) ? SQL_FetchInt(profileCount, 0) : -1;
+        if (profileCount != null)
+        {
+            delete profileCount;
+        }
+        ReplyToCommand(admin, "[LumiAdmin-Access] rows: whitelist=%d bans=%d access_profiles=%d",
+            whitelistTotal, banTotal, profileTotal);
+    }
 
     if (g_AccessRecentEventCount > 0)
     {
