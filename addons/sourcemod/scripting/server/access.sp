@@ -135,7 +135,7 @@ void LocalAccessFallback(int client)
     if (!ShouldFailOpenAccessCheck())
     {
         LogAccessEvent("kick", "rules unavailable, fail_closed");
-        ReportAccessDecision(client, steamId, ipAddress, false, "whitelist_rejected", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
+        ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
         MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
         KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
         return;
