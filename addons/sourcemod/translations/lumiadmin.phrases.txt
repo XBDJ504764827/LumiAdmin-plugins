@@ -152,6 +152,12 @@
 		"en"		"Your whitelist status cannot be confirmed, please try again later."
 		"zh"		"你的白名单状态无法确认，请稍后再试。"
 	}
+	"Access Denied Reason"
+	{
+		"en"		"Access denied: %s"
+		"#format"	"{1:s}"
+		"zh"		"%s"
+	}
 	"Access Offline Mode"
 	{
 		"en"		"Access control is running in offline mode, your access follows the local policy snapshot."
