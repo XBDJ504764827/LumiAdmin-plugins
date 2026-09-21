@@ -76,7 +76,7 @@ void LocalAccessFallback(int client)
             return;
         }
         LogAccessEvent("allow", "snapshot unavailable, fail_open");
-        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "snapshot unavailable, fail_open");
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
         RequestAccessSnapshotRefresh(true);
         return;
     }
@@ -103,7 +103,7 @@ void LocalAccessFallback(int client)
             return;
         }
         LogAccessEvent("allow", "no steamid, fail_open");
-        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "no steamid, fail_open");
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
         return;
     }
 
@@ -118,14 +118,16 @@ void LocalAccessFallback(int client)
             return;
         }
         LogAccessEvent("allow", "rules unconfirmed, fail_open (fallback)");
-        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "rules unconfirmed, fail_open");
+        // 规则未确认说明本地 server_rules 缺失/异常：以无限制上报，但触发一次全量快照补写规则。
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
+        RequestAccessSnapshotRefresh(true);
         return;
     }
 
     LogAccessEvent("allow", "local snapshot fallback");
     char allowMethod[32];
     LocalAllowAccessMethod(allowMethod, sizeof(allowMethod));
-    ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "local snapshot");
+    ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
 }
 
 /**
@@ -384,14 +386,41 @@ void RefreshAccessSnapshot()
     JSONObject payload = new JSONObject();
     payload.SetString("report_token", token);
     payload.SetInt("port", currentPort);
-    // etag 增量：回传现有快照版本，后端无变化时跳过全量传输
-    if (g_AccessSnapshotEtag[0] != '\0')
+    // etag 增量：回传现有快照版本，后端无变化时跳过全量传输。
+    // 例外：本地 server_rules 缺失/异常时省略 etag，强制后端回全量以补写规则，
+    // 避免「etag 命中 unchanged → 规则表永远为空 → 本地裁决全部 fail_open」。
+    if (g_AccessSnapshotEtag[0] != '\0' && LocalServerRulesPresent())
     {
         payload.SetString("etag", g_AccessSnapshotEtag);
+    }
+    else if (g_AccessSnapshotEtag[0] != '\0')
+    {
+        LogError("[LumiAdmin-Access] local server_rules missing; forcing full snapshot refresh.");
     }
 
     PostJsonObject(url, payload, OnAccessSnapshotResponse, 0, g_AccessCheckTimeout.FloatValue);
     delete payload;
+}
+
+/**
+ * 本地规则表是否已写入（server_rules 有 id=1 行）。
+ * 用于决定快照刷新是否可走 etag 增量。
+ */
+bool LocalServerRulesPresent()
+{
+    if (g_AccessSnapshotDb == null)
+    {
+        return false;
+    }
+
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT 1 FROM server_rules WHERE id = 1 LIMIT 1");
+    if (results == null)
+    {
+        return false;
+    }
+    bool present = SQL_FetchRow(results);
+    delete results;
+    return present;
 }
 
 public void OnAccessSnapshotResponse(HTTPResponse response, any value, const char[] error)
@@ -496,6 +525,14 @@ void InitAccessSnapshotDb()
         {
             g_AuthLastAppliedVersion = 0;
         }
+    }
+
+    // 规则表缺失（升级/首次/上次写入回滚）时：清掉 etag，确保下次刷新带回全量规则，
+    // 否则 etag 命中 unchanged 会让规则表永远为空，本地裁决全部 fail_open。
+    if (!LocalServerRulesPresent())
+    {
+        LogError("[LumiAdmin-Access] local server_rules missing at startup; full snapshot required.");
+        g_AccessSnapshotEtag[0] = '\0';
     }
 }
 
@@ -768,6 +805,14 @@ void SaveAccessSnapshot(JSONObject item)
             return;
         }
         delete server;
+    }
+    else
+    {
+        // 缺少 server 段：不能清空规则表后留下空状态（会导致本地裁决全部 fail_open），
+        // 直接回滚保留旧规则，等待下一次带 server 的全量快照。
+        LogError("[LumiAdmin-Access] access snapshot: missing server rules, ROLLBACK.");
+        SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
+        return;
     }
 
     JSONArray bans = view_as<JSONArray>(item.Get("bans"));
