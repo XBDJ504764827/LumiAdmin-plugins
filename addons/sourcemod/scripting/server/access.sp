@@ -126,25 +126,66 @@ void LocalAccessFallback(int client)
 
     LogAccessEvent("allow", "local snapshot fallback");
     char allowMethod[32];
-    LocalAllowAccessMethod(allowMethod, sizeof(allowMethod));
+    LocalAllowAccessMethod(steamId, allowMethod, sizeof(allowMethod));
     ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
 }
 
 /**
- * 本地放行时推断进服方式：白名单模式 → whitelist；进入限制 → restriction；
- * 均未开启 → unrestricted。用于进服监控展示。
+ * 本地放行时推断进服方式，与后端 /access/check 的判定顺序保持一致：
+ *   1. 均未开启 → unrestricted
+ *   2. 进入限制开启且玩家满足 rating/level → restriction
+ *   3. 白名单模式开启且玩家在白名单 → whitelist
+ * 结果用于进服监控展示「玩家是靠白名单还是靠满足门槛进入」。
  */
-void LocalAllowAccessMethod(char[] method, int maxLen)
+void LocalAllowAccessMethod(const char[] steamId, char[] method, int maxLen)
 {
     strcopy(method, maxLen, "unrestricted");
-    if (SnapshotHasRule("whitelist_mode_enabled"))
-    {
-        strcopy(method, maxLen, "whitelist");
-    }
-    else if (SnapshotHasRule("access_restriction_enabled"))
+
+    if (SnapshotHasRule("access_restriction_enabled") && OfflineProfileMeetsRule(steamId))
     {
         strcopy(method, maxLen, "restriction");
+        return;
     }
+    if (SnapshotHasRule("whitelist_mode_enabled") && OfflineWhitelistContains(steamId))
+    {
+        strcopy(method, maxLen, "whitelist");
+        return;
+    }
+}
+
+/**
+ * 玩家是否满足本地快照中的进入限制（rating / steam level）。
+ * 与 OfflineRulesAllowClient 使用同一 server_rules 口径，供进服方式推断复用。
+ */
+bool OfflineProfileMeetsRule(const char[] steamId)
+{
+    if (g_AccessSnapshotDb == null)
+    {
+        return false;
+    }
+
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT min_rating, min_steam_level FROM server_rules WHERE id = 1");
+    if (results == null)
+    {
+        return false;
+    }
+
+    bool meets = false;
+    if (SQL_FetchRow(results))
+    {
+        int minRating = SQL_FetchInt(results, 0);
+        int minSteamLevel = SQL_FetchInt(results, 1);
+        if (minRating <= 0 && minSteamLevel <= 0)
+        {
+            meets = true;
+        }
+        else
+        {
+            meets = OfflineProfileMeetsRequirement(steamId, minRating, minSteamLevel);
+        }
+    }
+    delete results;
+    return meets;
 }
 
 
