@@ -127,7 +127,8 @@ sync / recordguard 无配置文件，convar 使用合理默认值，需要时可
 | `POST /api/plugin/bans/check` | 玩家进服时 | 单玩家封禁检查 |
 | `POST /api/plugin/bans` | sm_ban/sm_banip/sm_addban | 提交封禁 |
 | `POST /api/plugin/bans/unban` | sm_unban | 提交解封 |
-| `POST /api/plugin/access/check` | 玩家授权后 | 进服权限检查（is_cs_prime 字段不再上报） |
+| `POST /api/plugin/access/check` | 后台对账/兼容 | 进服权限检查（本地自治后主链路不再调用） |
+| `POST /api/plugin/access/record` | 玩家授权后本地裁决完成 | 上报本地进服裁决结果（供后台「进服监控」展示） |
 | `POST /api/plugin/access/snapshot` | 每 `server_access_snapshot_interval` 秒 | 拉取权限快照写入本地 SQLite（断网应急） |
 
 ### 4.3 sync
