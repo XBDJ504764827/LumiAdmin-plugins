@@ -98,8 +98,8 @@
 	}
 	"Ban Invalid SteamID"
 	{
-		"en"		"Invalid SteamID: %s"
 		"#format"	"{1:s}"
+		"en"		"Invalid SteamID: %s"
 		"zh"		"SteamID 无效：%s"
 	}
 	"Ban API Not Configured"
@@ -119,8 +119,8 @@
 	}
 	"Unban Failed Generic"
 	{
-		"en"		"Unban request failed: %s"
 		"#format"	"{1:s}"
+		"en"		"Unban request failed: %s"
 		"zh"		"解封请求失败：%s"
 	}
 	"Unban Failed Retry"
@@ -130,14 +130,14 @@
 	}
 	"Unban Failed HTTP"
 	{
-		"en"		"Unban request failed, HTTP status %d."
 		"#format"	"{1:d}"
+		"en"		"Unban request failed, HTTP status %d."
 		"zh"		"解封请求失败，HTTP 状态码 %d。"
 	}
 	"Kick Banned Message"
 	{
-		"en"		"You have been banned: %s"
 		"#format"	"{1:s}"
+		"en"		"You have been banned: %s"
 		"zh"		"你已被封禁：%s"
 	}
 
