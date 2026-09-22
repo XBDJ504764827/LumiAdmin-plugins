@@ -111,7 +111,7 @@ void LocalAccessFallback(int client)
     char denyMethod[32];
     char denyFailureCode[48];
     char denyReason[256];
-    LocalRuleDecision decision = OfflineEvaluateRules(steamId, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+    LocalRuleDecision decision = OfflineEvaluateRules(steamId, ipAddress, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
 
     if (decision == LocalRule_Allow)
     {
@@ -124,10 +124,12 @@ void LocalAccessFallback(int client)
     {
         // 明确不满足白名单/门槛：本地自治主链路下直接踢，白名单才真正生效。
         // 这与文件头「命中封禁/白名单缺失/门槛不满足即立即 Kick，grace=0」一致。
+        // 注意：直接用 %s 展示原因，不走 %T 翻译，避免翻译文件未更新时
+        // KickClient 抛异常导致「判定拒绝却没有真正踢出」。
         LogAccessEvent("kick", "rules denied (local snapshot)");
         ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
         MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
-        KickClient(client, "%T", "Access Denied Reason", client, denyReason);
+        KickClient(client, "%s", denyReason);
         return;
     }
 
@@ -170,6 +172,7 @@ enum LocalRuleDecision
  */
 LocalRuleDecision OfflineEvaluateRules(
     const char[] steamId,
+    const char[] ipAddress,
     char[] allowMethod, int methodMaxLen,
     char[] denyMethod, int denyMethodMaxLen,
     char[] denyFailureCode, int failMaxLen,
@@ -185,7 +188,7 @@ LocalRuleDecision OfflineEvaluateRules(
         return LocalRule_Unavailable;
     }
 
-    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level FROM server_rules WHERE id = 1");
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled FROM server_rules WHERE id = 1");
     if (results == null)
     {
         return LocalRule_Unavailable;
@@ -202,11 +205,21 @@ LocalRuleDecision OfflineEvaluateRules(
     bool accessRestrictionEnabled = SQL_FetchInt(results, 1) != 0;
     int minRating = SQL_FetchInt(results, 2);
     int minSteamLevel = SQL_FetchInt(results, 3);
+    bool riskBlockEnabled = results.FieldCount > 4 && SQL_FetchInt(results, 4) != 0;
     delete results;
 
     bool hasWhitelist = whitelistModeEnabled && OfflineWhitelistContains(steamId);
     bool meetsRestriction = accessRestrictionEnabled
         && (minRating <= 0 && minSteamLevel <= 0 ? true : OfflineProfileMeetsRequirement(steamId, minRating, minSteamLevel));
+
+    // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效封禁账号关联 → 拒绝
+    if (riskBlockEnabled && !(whitelistModeEnabled && hasWhitelist) && OfflineIpHasRisk(ipAddress))
+    {
+        strcopy(denyMethod, denyMethodMaxLen, "risk_blocked");
+        strcopy(denyFailureCode, failMaxLen, "risk_blocked");
+        strcopy(denyReason, reasonMaxLen, "检测到你的网络环境存在风险，暂时无法进入该服务器。");
+        return LocalRule_Deny;
+    }
 
     // 均未开启 → 无限制放行
     if (!whitelistModeEnabled && !accessRestrictionEnabled)
@@ -334,6 +347,30 @@ bool OfflineWhitelistContains(const char[] steamId)
     char query[256];
     SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
     Format(query, sizeof(query), "SELECT steam_id FROM whitelist WHERE steam_id = '%s' LIMIT 1", escapedSteamId);
+
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
+    if (results == null)
+    {
+        return false;
+    }
+
+    bool found = SQL_FetchRow(results);
+    delete results;
+    return found;
+}
+
+// 当前 IP 是否与「当前有效封禁账号」关联（快照 risk_ips 集合，供 risk_block 使用）
+bool OfflineIpHasRisk(const char[] ipAddress)
+{
+    if (ipAddress[0] == '\0')
+    {
+        return false;
+    }
+
+    char escapedIpAddress[128];
+    char query[256];
+    SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIpAddress, sizeof(escapedIpAddress));
+    Format(query, sizeof(query), "SELECT 1 FROM risk_ips WHERE ip = '%s' LIMIT 1", escapedIpAddress);
 
     DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
     if (results == null)
@@ -568,7 +605,10 @@ void InitAccessSnapshotDb()
     }
 
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS server_rules (id INTEGER PRIMARY KEY CHECK (id = 1), whitelist_mode_enabled INTEGER NOT NULL, access_restriction_enabled INTEGER NOT NULL, min_rating INTEGER NOT NULL, min_steam_level INTEGER NOT NULL)");
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS server_rules (id INTEGER PRIMARY KEY CHECK (id = 1), whitelist_mode_enabled INTEGER NOT NULL, access_restriction_enabled INTEGER NOT NULL, min_rating INTEGER NOT NULL, min_steam_level INTEGER NOT NULL, risk_block_enabled INTEGER NOT NULL DEFAULT 0)");
+    // 旧库升级：补 risk_block_enabled 列（CREATE IF NOT EXISTS 不会改已有表）
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE server_rules ADD COLUMN risk_block_enabled INTEGER NOT NULL DEFAULT 0");
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS risk_ips (ip TEXT PRIMARY KEY)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS bans (steam_id TEXT, ip_address TEXT, reason TEXT NOT NULL, expires_at INTEGER)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS whitelist (steam_id TEXT PRIMARY KEY)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS access_profiles (steam_id TEXT PRIMARY KEY, rating INTEGER NOT NULL, steam_level INTEGER NOT NULL, expires_at INTEGER NOT NULL)");
@@ -799,13 +839,13 @@ void AuthReconcileOnlinePlayers()
         char denyMethod[32];
         char denyFailureCode[48];
         char denyReason[256];
-        LocalRuleDecision decision = OfflineEvaluateRules(steamId, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+        LocalRuleDecision decision = OfflineEvaluateRules(steamId, ip, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
         if (decision == LocalRule_Deny)
         {
             LogAccessEvent("kick", "reconcile: rules denied");
             ReportAccessDecision(client, steamId, ip, false, denyMethod, denyFailureCode, denyReason);
             MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
-            KickClient(client, "%T", "Access Denied Reason", client, denyReason);
+            KickClient(client, "%s", denyReason);
         }
         else if (decision == LocalRule_Unavailable && !ShouldFailOpenAccessCheck())
         {
@@ -833,7 +873,8 @@ void SaveAccessSnapshot(JSONObject item)
         || !SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM server_rules")
         || !SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM bans")
         || !SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM whitelist")
-        || !SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM access_profiles"))
+        || !SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM access_profiles")
+        || !SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM risk_ips"))
     {
         LogError("[LumiAdmin-Access] access snapshot: cleanup failed, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
@@ -873,11 +914,12 @@ void SaveAccessSnapshot(JSONObject item)
     {
         char query[512];
         Format(query, sizeof(query),
-            "INSERT INTO server_rules (id, whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level) VALUES (1, %d, %d, %d, %d)",
+            "INSERT INTO server_rules (id, whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled) VALUES (1, %d, %d, %d, %d, %d)",
             LumiJsonGetBool(server, "whitelist_mode_enabled") ? 1 : 0,
             LumiJsonGetBool(server, "access_restriction_enabled") ? 1 : 0,
             LumiJsonGetInt(server, "min_rating"),
-            LumiJsonGetInt(server, "min_steam_level"));
+            LumiJsonGetInt(server, "min_steam_level"),
+            LumiJsonGetBool(server, "risk_block_enabled") ? 1 : 0);
         if (!SQL_FastQuery(g_AccessSnapshotDb, query))
         {
             LogError("[LumiAdmin-Access] access snapshot: server_rules insert failed, ROLLBACK.");
@@ -932,6 +974,18 @@ void SaveAccessSnapshot(JSONObject item)
         return;
     }
 
+    JSONArray riskIps = view_as<JSONArray>(item.Get("risk_ips"));
+    bool riskIpsSaved = SaveSnapshotRiskIps(riskIps);
+    if (riskIps != null)
+    {
+        delete riskIps;
+    }
+    if (!riskIpsSaved)
+    {
+        SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
+        return;
+    }
+
     if (!SQL_FastQuery(g_AccessSnapshotDb, "COMMIT"))
     {
         LogError("[LumiAdmin-Access] access snapshot: COMMIT failed, ROLLBACK.");
@@ -942,7 +996,7 @@ void SaveAccessSnapshot(JSONObject item)
     g_AccessSnapshotBackoffStep = 0;
     g_AccessSnapshotLastRefreshOk = GetTime();
     strcopy(g_AccessSnapshotEtag, sizeof(g_AccessSnapshotEtag), version);
-    LogMessage("[LumiAdmin-Access] snapshot refreshed: version '%s', bans/whitelist/profiles updated.", version);
+    LogMessage("[LumiAdmin-Access] snapshot refreshed: version '%s', bans/whitelist/profiles/risk_ips updated.", version);
 }
 
 bool InsertMetadata(const char[] key, const char[] value)
@@ -957,6 +1011,38 @@ bool InsertMetadata(const char[] key, const char[] value)
     {
         LogError("[LumiAdmin-Access] access snapshot: metadata insert failed for key '%s'", key);
         return false;
+    }
+    return true;
+}
+
+bool SaveSnapshotRiskIps(JSONArray riskIps)
+{
+    if (riskIps == null)
+    {
+        return true;
+    }
+
+    char query[256];
+    for (int i = 0; i < riskIps.Length; i++)
+    {
+        char ip[64];
+        if (!riskIps.GetString(i, ip, sizeof(ip)))
+        {
+            continue;
+        }
+        if (ip[0] == '\0')
+        {
+            continue;
+        }
+
+        char escapedIp[128];
+        SQL_EscapeString(g_AccessSnapshotDb, ip, escapedIp, sizeof(escapedIp));
+        Format(query, sizeof(query), "INSERT OR IGNORE INTO risk_ips (ip) VALUES ('%s')", escapedIp);
+        if (!SQL_FastQuery(g_AccessSnapshotDb, query))
+        {
+            LogError("[LumiAdmin-Access] access snapshot: risk_ips insert failed at index %d", i);
+            return false;
+        }
     }
     return true;
 }
@@ -1250,13 +1336,14 @@ Action CommandAccessStatus(int admin, int args)
 
         char ruleText[128];
         ruleText[0] = '\0';
-        DBResultSet ruleSet = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level FROM server_rules WHERE id = 1");
+        DBResultSet ruleSet = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled FROM server_rules WHERE id = 1");
         if (ruleSet != null)
         {
             if (SQL_FetchRow(ruleSet))
             {
-                Format(ruleText, sizeof(ruleText), "whitelist=%d restriction=%d min_rating=%d min_level=%d",
-                    SQL_FetchInt(ruleSet, 0), SQL_FetchInt(ruleSet, 1), SQL_FetchInt(ruleSet, 2), SQL_FetchInt(ruleSet, 3));
+                Format(ruleText, sizeof(ruleText), "whitelist=%d restriction=%d min_rating=%d min_level=%d risk_block=%d",
+                    SQL_FetchInt(ruleSet, 0), SQL_FetchInt(ruleSet, 1), SQL_FetchInt(ruleSet, 2), SQL_FetchInt(ruleSet, 3),
+                    ruleSet.FieldCount > 4 ? SQL_FetchInt(ruleSet, 4) : 0);
             }
             delete ruleSet;
         }
@@ -1280,8 +1367,14 @@ Action CommandAccessStatus(int admin, int args)
         {
             delete profileCount;
         }
-        ReplyToCommand(admin, "[LumiAdmin-Access] rows: whitelist=%d bans=%d access_profiles=%d",
-            whitelistTotal, banTotal, profileTotal);
+        DBResultSet riskIpCount = SQL_Query(g_AccessSnapshotDb, "SELECT COUNT(*) FROM risk_ips");
+        int riskIpTotal = (riskIpCount != null && SQL_FetchRow(riskIpCount)) ? SQL_FetchInt(riskIpCount, 0) : -1;
+        if (riskIpCount != null)
+        {
+            delete riskIpCount;
+        }
+        ReplyToCommand(admin, "[LumiAdmin-Access] rows: whitelist=%d bans=%d access_profiles=%d risk_ips=%d",
+            whitelistTotal, banTotal, profileTotal, riskIpTotal);
     }
 
     if (g_AccessRecentEventCount > 0)
