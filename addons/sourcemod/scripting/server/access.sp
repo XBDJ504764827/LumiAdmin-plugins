@@ -130,6 +130,12 @@ void LocalAccessFallback(int client)
         ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
         MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
         KickClient(client, "%s", denyReason);
+        // 资料未验证：触发一次立即快照刷新，配合后端拒绝驱动的资料强刷加速自愈
+        // （拒绝上报本身会触发后端强制复核，快照刷新让新鲜资料尽快到达插件）。
+        if (StrEqual(denyFailureCode, "profile_missing"))
+        {
+            RequestAccessSnapshotRefresh(true);
+        }
         return;
     }
 
@@ -209,8 +215,16 @@ LocalRuleDecision OfflineEvaluateRules(
     delete results;
 
     bool hasWhitelist = whitelistModeEnabled && OfflineWhitelistContains(steamId);
-    bool meetsRestriction = accessRestrictionEnabled
-        && (minRating <= 0 && minSteamLevel <= 0 ? true : OfflineProfileMeetsRequirement(steamId, minRating, minSteamLevel));
+
+    int profileRating = 0;
+    int profileSteamLevel = 0;
+    ProfileCheck profileCheck = ProfileCheck_Missing;
+    bool meetsRestriction = accessRestrictionEnabled;
+    if (accessRestrictionEnabled && !(minRating <= 0 && minSteamLevel <= 0))
+    {
+        profileCheck = OfflineCheckProfile(steamId, minRating, minSteamLevel, profileRating, profileSteamLevel);
+        meetsRestriction = profileCheck == ProfileCheck_Meets;
+    }
 
     // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效封禁账号关联 → 拒绝
     if (riskBlockEnabled && !(whitelistModeEnabled && hasWhitelist) && OfflineIpHasRisk(ipAddress))
@@ -242,7 +256,9 @@ LocalRuleDecision OfflineEvaluateRules(
         return LocalRule_Allow;
     }
 
-    // 明确拒绝：按启用模式给出原因与失败码（与后端 access/check 组合一致）
+    // 明确拒绝：按启用模式给出原因与失败码（与后端 access/check 组合一致）。
+    // 限制侧失败码细分：low_rating / low_steam_level / profile_missing，
+    // 供进服监控准确展示（资料未验证 ≠ Rating 不足）。
     if (whitelistModeEnabled && !hasWhitelist && !accessRestrictionEnabled)
     {
         strcopy(denyMethod, denyMethodMaxLen, "whitelist_rejected");
@@ -252,20 +268,20 @@ LocalRuleDecision OfflineEvaluateRules(
     else if (accessRestrictionEnabled && !meetsRestriction && !whitelistModeEnabled)
     {
         strcopy(denyMethod, denyMethodMaxLen, "restriction_rejected");
-        strcopy(denyFailureCode, failMaxLen, "restriction_rejected");
-        strcopy(denyReason, reasonMaxLen, "你的资料未达到该服务器的最低进入要求。");
+        FormatProfileDeny(profileCheck, profileRating, profileSteamLevel, minRating, minSteamLevel, denyFailureCode, failMaxLen, denyReason, reasonMaxLen);
     }
     else if (whitelistModeEnabled && !hasWhitelist && accessRestrictionEnabled && !meetsRestriction)
     {
+        // 组合拒绝：白名单与门槛均未满足；失败码给出限制侧的具体原因，便于审计区分
         strcopy(denyMethod, denyMethodMaxLen, "restriction_rejected");
-        strcopy(denyFailureCode, failMaxLen, "restriction_rejected");
+        FormatProfileDeny(profileCheck, profileRating, profileSteamLevel, minRating, minSteamLevel, denyFailureCode, failMaxLen, denyReason, reasonMaxLen);
         strcopy(denyReason, reasonMaxLen, "你既没有该服务器的白名单，也未达到最低进入要求。");
     }
     else
     {
         // 组合下至少其一满足即已放行，走到这里说明白名单与门槛均未满足
         strcopy(denyMethod, denyMethodMaxLen, "restriction_rejected");
-        strcopy(denyFailureCode, failMaxLen, "restriction_rejected");
+        FormatProfileDeny(profileCheck, profileRating, profileSteamLevel, minRating, minSteamLevel, denyFailureCode, failMaxLen, denyReason, reasonMaxLen);
         strcopy(denyReason, reasonMaxLen, "你的资料未满足服务器进入要求。");
     }
     return LocalRule_Deny;
@@ -383,33 +399,92 @@ bool OfflineIpHasRisk(const char[] ipAddress)
     return found;
 }
 
-bool OfflineProfileMeetsRequirement(const char[] steamId, int minRating, int minSteamLevel)
+/**
+ * 玩家进服资料（rating / steam_level）本地校验结果：
+ *  - Meets          ：资料存在且未过期，rating 与 steam 等级均达标
+ *  - LowRating      ：rating 低于门槛（资料存在，玩家确实未达标）
+ *  - LowSteamLevel  ：steam 等级低于门槛
+ *  - Missing        ：快照无该玩家资料或资料已过期 → 是「未验证」而非「不达标」，
+ *                     上报 profile_missing，由拒绝驱动的资料强刷链路自愈
+ */
+enum ProfileCheck
 {
-    if (minRating <= 0 && minSteamLevel <= 0)
-    {
-        return true;
-    }
+    ProfileCheck_Meets = 0,
+    ProfileCheck_LowRating = 1,
+    ProfileCheck_LowSteamLevel = 2,
+    ProfileCheck_Missing = 3,
+}
+
+/**
+ * 校验快照 access_profiles 中的玩家资料是否满足进服门槛。
+ * rating / steamLevel 在资料存在时输出实际值（用于拒绝原因展示）。
+ * 带 expires_at 过滤：过期资料视为未验证，避免快照刷新长期失败时用过期数据裁决。
+ */
+ProfileCheck OfflineCheckProfile(const char[] steamId, int minRating, int minSteamLevel, int &rating, int &steamLevel)
+{
+    rating = 0;
+    steamLevel = 0;
 
     char escapedSteamId[128];
     char query[256];
     SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
-    Format(query, sizeof(query), "SELECT rating, steam_level FROM access_profiles WHERE steam_id = '%s' LIMIT 1", escapedSteamId);
+    Format(query, sizeof(query), "SELECT rating, steam_level, expires_at FROM access_profiles WHERE steam_id = '%s' LIMIT 1", escapedSteamId);
 
     DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
     if (results == null)
     {
-        return false;
+        return ProfileCheck_Missing;
     }
 
-    bool meets = false;
+    ProfileCheck result = ProfileCheck_Missing;
     if (SQL_FetchRow(results))
     {
-        int rating = SQL_FetchInt(results, 0);
-        int steamLevel = SQL_FetchInt(results, 1);
-        meets = rating >= minRating && steamLevel >= minSteamLevel;
+        rating = SQL_FetchInt(results, 0);
+        steamLevel = SQL_FetchInt(results, 1);
+        int expiresAt = SQL_FetchInt(results, 2);
+        if (expiresAt > 0 && expiresAt <= GetTime())
+        {
+            result = ProfileCheck_Missing;
+        }
+        else if (rating < minRating)
+        {
+            result = ProfileCheck_LowRating;
+        }
+        else if (steamLevel < minSteamLevel)
+        {
+            result = ProfileCheck_LowSteamLevel;
+        }
+        else
+        {
+            result = ProfileCheck_Meets;
+        }
     }
     delete results;
-    return meets;
+    return result;
+}
+
+/**
+ * 由资料校验结果生成限制侧失败码与拒绝原因。
+ * low_rating / low_steam_level 的原因带具体数值，玩家与管理员可直接对账；
+ * profile_missing 提示稍后重试（自愈链路正在刷新资料）。
+ */
+void FormatProfileDeny(ProfileCheck check, int rating, int steamLevel, int minRating, int minSteamLevel, char[] failCode, int failMaxLen, char[] reason, int reasonMaxLen)
+{
+    if (check == ProfileCheck_LowRating)
+    {
+        strcopy(failCode, failMaxLen, "low_rating");
+        Format(reason, reasonMaxLen, "你的 Rating %d 未达到该服务器要求的 %d。", rating, minRating);
+    }
+    else if (check == ProfileCheck_LowSteamLevel)
+    {
+        strcopy(failCode, failMaxLen, "low_steam_level");
+        Format(reason, reasonMaxLen, "你的 Steam 等级 %d 未达到该服务器要求的 %d。", steamLevel, minSteamLevel);
+    }
+    else
+    {
+        strcopy(failCode, failMaxLen, "profile_missing");
+        strcopy(reason, reasonMaxLen, "你的进入资料尚未验证，请稍后再试。");
+    }
 }
 
 // =====[ 熔断器（已删除：在线复核层随 LumiAuth 上线退役，后台补偿靠 auth_sync 退避）]=====
