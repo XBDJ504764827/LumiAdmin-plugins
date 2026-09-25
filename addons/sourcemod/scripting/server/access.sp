@@ -1,8 +1,13 @@
 /**
- * 进服权限检查：本地同步裁决（LumiAuth Data Plane），grace=0。
+ * 进服权限检查：本地同步裁决（LumiAuth Data Plane）。
  *
  * - OnClientAuthorized 内同步读本地 SQLite（含内存规则），命中封禁/白名单缺失/
- *   门槛不满足即立即 Kick，不等待任何 HTTP；
+ *   确认的门槛不足即立即 Kick，不等待任何 HTTP；
+ * - 限制侧软失败（profile_missing 缺资料 / low_rating-low_steam_level 旧快照低分，
+ *   即“玩家可能刚达标、快照还没追上”）则先放行并点查直取
+ *   （POST /api/plugin/access/profile，server_access_missing_grace 秒，默认 3s）：
+ *   点查早到即提前裁决，宽限到期做最终裁决（零容忍：仍未验证/确认不达标即踢）。
+ *   未达标玩家在服内最多存在宽限时长；
  * - /access/check 在线复核已退役为主链路，仅保留后台对账（auth_sync 恢复后全服复核补踢）；
  * - 熔断器保留用于后台补偿链路（快照刷新/ban poll），不再阻塞进服。
  *
@@ -28,7 +33,11 @@ public void OnClientAuthorized(int client, const char[] auth)
         return;
     }
 
-    // 本地同步裁决：零网络等待，grace=0（快照说不在白名单即直接阻止进入）。
+    if (client > 0 && client <= MaxClients)
+    {
+        g_AccessMissingDeferred[client] = 0;
+    }
+    // 本地同步裁决：零网络等待（资料未验证除外：先放行并延迟复核，见下）。
     LocalAccessDecide(client);
 }
 
@@ -41,6 +50,19 @@ void LocalAccessDecide(int client)
     LocalAccessFallback(client);
 }
 
+/**
+ * 限制侧软失败：快照缺资料（profile_missing）或快照资料为旧低分
+ * （low_rating / low_steam_level，快照 30s 拉取 + 后端强刷节流导致）。
+ * 这类拒绝可能是“玩家刚达标、快照还没追上”，走宽限延迟复核而非立即踢；
+ * 封禁 / 白名单缺失 / 中高风险等硬拒绝不在此列，仍立即踢出。
+ */
+bool IsGraceableRestrictionDeny(const char[] failureCode)
+{
+    return StrEqual(failureCode, "profile_missing")
+        || StrEqual(failureCode, "low_rating")
+        || StrEqual(failureCode, "low_steam_level");
+}
+
 // =====[ 在线复核层（已退役为主链路，仅后台对账保留；进服用 LocalAccessDecide）]=====
 
 // 在线复核层已退役：历史入口/回调/载荷构造全部删除。
@@ -49,7 +71,7 @@ void LocalAccessDecide(int client)
 // =====[ 本地快照兜底 ]=====
 
 /**
- * 本地裁决：进服主链路（同步，零网络等待，grace=0）。
+ * 本地裁决：进服主链路（同步，零网络等待；资料未验证走宽限延迟复核）。
  * 快照「陈旧但可用」：过期只告警，不作为放行或踢人依据。
  */
 void LocalAccessFallback(int client)
@@ -122,8 +144,24 @@ void LocalAccessFallback(int client)
 
     if (decision == LocalRule_Deny)
     {
-        // 明确不满足白名单/门槛：本地自治主链路下直接踢，白名单才真正生效。
-        // 这与文件头「命中封禁/白名单缺失/门槛不满足即立即 Kick，grace=0」一致。
+        // 限制侧软失败（缺资料/旧低分）：点查直取 + 宽限终裁。点查回调早到即提前裁决
+        // （达标 1s 内确认，不用等满宽限），宽限定时器做最终裁决（零容忍）。
+        if (IsGraceableRestrictionDeny(denyFailureCode))
+        {
+            float grace = (g_AccessMissingGrace == null) ? 3.0 : g_AccessMissingGrace.FloatValue;
+            if (grace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
+            {
+                g_AccessMissingDeferred[client] = 1;
+                LogAccessEvent("allow", "restriction soft-deny, point query + grace recheck");
+                ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
+                RequestPlayerProfile(client, steamId);
+                RequestAccessSnapshotRefresh(true);
+                CreateTimer(grace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+                return;
+            }
+        }
+        // 硬拒绝（封禁/白名单缺失/中高风险/确认不达标且宽限已用过或已关闭）：
+        // 本地自治主链路下直接踢，白名单才真正生效。
         // 注意：直接用 %s 展示原因，不走 %T 翻译，避免翻译文件未更新时
         // KickClient 抛异常导致「判定拒绝却没有真正踢出」。
         LogAccessEvent("kick", "rules denied (local snapshot)");
@@ -152,6 +190,193 @@ void LocalAccessFallback(int client)
     ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
     RequestAccessSnapshotRefresh(true);
     return;
+}
+
+/**
+ * 限制侧宽限终裁（点查回调早到 / 宽限定时器到期共用）。
+ * 快照/点查已追平 → 留服；到期仍未验证或确认不达标 → 踢出（零容忍）。
+ * kickOnMissing=false（点查回调）时若仍是软失败则不动，等宽限定时器终裁。
+ */
+void RecheckAccessAfterProfile(int client, const char[] tag, bool kickOnMissing)
+{
+    char steamId[64];
+    char ipAddress[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        return;
+    }
+    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+
+    char reason[256];
+    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
+    {
+        LogAccessEvent("kick", "grace recheck: banned");
+        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
+        MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
+        KickClient(client, "%T", "Kick Banned Message", client, reason);
+        return;
+    }
+
+    char allowMethod[32];
+    char denyMethod[32];
+    char denyFailureCode[48];
+    char denyReason[256];
+    LocalRuleDecision decision = OfflineEvaluateRules(steamId, ipAddress, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+    if (decision == LocalRule_Allow)
+    {
+        LogAccessEvent("allow", tag);
+        ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
+        return;
+    }
+    if (decision == LocalRule_Deny)
+    {
+        if (!kickOnMissing && IsGraceableRestrictionDeny(denyFailureCode))
+        {
+            return;
+        }
+        LogAccessEvent("kick", tag);
+        ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
+        KickClient(client, "%s", denyReason);
+        return;
+    }
+
+    if (!ShouldFailOpenAccessCheck())
+    {
+        LogAccessEvent("kick", "grace recheck: rules unavailable, fail_closed");
+        ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
+        KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
+    }
+}
+
+/**
+ * 宽限定时器：最终裁决（零容忍）。未达标玩家在服内存在时长不超过宽限。
+ */
+public Action Timer_AccessMissingRecheck(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+    if (client > 0 && client <= MaxClients)
+    {
+        g_AccessMissingDeferred[client] = 2;
+    }
+    RecheckAccessAfterProfile(client, "grace recheck: synced", true);
+    return Plugin_Stop;
+}
+
+/**
+ * 单玩家资料点查（宽限开始时触发，异步，不阻塞进服）。
+ * 后端命中缓存毫秒级返回；缺失时做有界同步拉取（约 2s），玩家无感知。
+ */
+void RequestPlayerProfile(int client, const char[] steamId)
+{
+    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
+    {
+        return;
+    }
+
+    char url[512];
+    char token[256];
+    if (!ResolvePluginApiConfig(url, sizeof(url), "/access/profile", token, sizeof(token)))
+    {
+        return;
+    }
+
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        return;
+    }
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", currentPort);
+    payload.SetString("steam_id64", steamId);
+
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamId);
+    PostJsonObject(url, payload, OnAccessProfileResponse, pack, g_AccessCheckTimeout.FloatValue);
+    delete payload;
+}
+
+public void OnAccessProfileResponse(HTTPResponse response, any value, const char[] error)
+{
+    DataPack pack = view_as<DataPack>(value);
+    int userid = 0;
+    char steamId[64];
+    steamId[0] = '\0';
+    if (pack != null)
+    {
+        pack.Reset();
+        userid = pack.ReadCell();
+        pack.ReadString(steamId, sizeof(steamId));
+        delete pack;
+    }
+    if (error[0] != '\0' || response.Status != HTTPStatus_OK)
+    {
+        // 点查失败/超时：宽限定时器会按零容忍终裁，这里只记日志
+        LogHttpPostFailure("access profile query", response, error);
+        return;
+    }
+
+    JSONObject root = view_as<JSONObject>(response.Data);
+    if (root == null)
+    {
+        return;
+    }
+    JSONObject item = view_as<JSONObject>(root.Get("item"));
+    if (item == null)
+    {
+        delete root;
+        return;
+    }
+    char itemSteamId[64];
+    item.GetString("steam_id64", itemSteamId, sizeof(itemSteamId));
+    if (itemSteamId[0] == '\0')
+    {
+        strcopy(itemSteamId, sizeof(itemSteamId), steamId);
+    }
+    int rating = LumiJsonGetInt(item, "rating");
+    int steamLevel = LumiJsonGetInt(item, "steam_level");
+    int expiresAt = LumiJsonGetInt(item, "expires_at_unix");
+    delete item;
+    delete root;
+
+    if (!UpsertAccessProfile(itemSteamId, rating, steamLevel, expiresAt))
+    {
+        return;
+    }
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return;
+    }
+    // 点查早到：立即复核，不用等满宽限；仍是软失败则等定时器终裁
+    RecheckAccessAfterProfile(client, "grace recheck: point query hit", false);
+}
+
+/**
+ * 点查资料写入本地表（INSERT OR REPLACE），复核即用，不必等快照轮询。
+ */
+bool UpsertAccessProfile(const char[] steamId, int rating, int steamLevel, int expiresAt)
+{
+    if (g_AccessSnapshotDb == null || steamId[0] == '\0' || expiresAt <= GetTime())
+    {
+        return false;
+    }
+
+    char escapedSteamId[128];
+    char query[512];
+    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
+    Format(query, sizeof(query),
+        "INSERT OR REPLACE INTO access_profiles (steam_id, rating, steam_level, expires_at) VALUES ('%s', %d, %d, %d)",
+        escapedSteamId, rating, steamLevel, expiresAt);
+    return SQL_FastQuery(g_AccessSnapshotDb, query);
 }
 
 /**
@@ -1388,7 +1613,8 @@ Action CommandAccessStatus(int admin, int args)
     }
 
     ReplyToCommand(admin, "[LumiAdmin-Access] ---- status ----");
-    ReplyToCommand(admin, "[LumiAdmin-Access] mode: local sync decide (grace=0), events reconcile");
+    ReplyToCommand(admin, "[LumiAdmin-Access] mode: local sync decide (missing-grace %.0fs), events reconcile",
+        (g_AccessMissingGrace == null) ? 25.0 : g_AccessMissingGrace.FloatValue);
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot db: %s", g_AccessSnapshotDb == null ? "UNAVAILABLE" : "ok");
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot age: %ds (stale snapshots still usable as fallback)", snapshotAge < 0 ? -1 : snapshotAge);
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot version: '%s' last ok refresh: %ds ago",
