@@ -1,8 +1,11 @@
 /**
- * 进服权限检查：本地同步裁决（LumiAuth Data Plane），grace=0。
+ * 进服权限检查：本地同步裁决（LumiAuth Data Plane）。
  *
  * - OnClientAuthorized 内同步读本地 SQLite（含内存规则），命中封禁/白名单缺失/
- *   门槛不满足即立即 Kick，不等待任何 HTTP；
+ *   确认的门槛不足即立即 Kick，不等待任何 HTTP；
+ * - 资料未验证（profile_missing，即快照尚无该玩家资料≠不达标）则先放行并延迟复核
+ *   （server_access_missing_grace 秒，默认 25s）：宽限内快照追平即留服，到期仍未
+ *   验证/确认不达标才踢出。达标玩家一次即进，不再需要重进两三次；
  * - /access/check 在线复核已退役为主链路，仅保留后台对账（auth_sync 恢复后全服复核补踢）；
  * - 熔断器保留用于后台补偿链路（快照刷新/ban poll），不再阻塞进服。
  *
@@ -28,7 +31,11 @@ public void OnClientAuthorized(int client, const char[] auth)
         return;
     }
 
-    // 本地同步裁决：零网络等待，grace=0（快照说不在白名单即直接阻止进入）。
+    if (client > 0 && client <= MaxClients)
+    {
+        g_AccessMissingDeferred[client] = 0;
+    }
+    // 本地同步裁决：零网络等待（资料未验证除外：先放行并延迟复核，见下）。
     LocalAccessDecide(client);
 }
 
@@ -49,7 +56,7 @@ void LocalAccessDecide(int client)
 // =====[ 本地快照兜底 ]=====
 
 /**
- * 本地裁决：进服主链路（同步，零网络等待，grace=0）。
+ * 本地裁决：进服主链路（同步，零网络等待；资料未验证走宽限延迟复核）。
  * 快照「陈旧但可用」：过期只告警，不作为放行或踢人依据。
  */
 void LocalAccessFallback(int client)
@@ -122,20 +129,28 @@ void LocalAccessFallback(int client)
 
     if (decision == LocalRule_Deny)
     {
-        // 明确不满足白名单/门槛：本地自治主链路下直接踢，白名单才真正生效。
-        // 这与文件头「命中封禁/白名单缺失/门槛不满足即立即 Kick，grace=0」一致。
+        // 资料未验证：先上报本次拒绝（触发后端强制复核资料强刷），再立即刷新快照，
+        // 随后按宽限延迟复核。快照追平即留服，玩家一次即进，无需重进。
+        if (StrEqual(denyFailureCode, "profile_missing"))
+        {
+            RequestAccessSnapshotRefresh(true);
+            float grace = (g_AccessMissingGrace == null) ? 25.0 : g_AccessMissingGrace.FloatValue;
+            if (grace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
+            {
+                g_AccessMissingDeferred[client] = 1;
+                LogAccessEvent("allow", "profile missing, grace recheck scheduled");
+                ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
+                CreateTimer(grace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+                return;
+            }
+        }
+        // 明确不满足白名单/门槛（或宽限已用过/已关闭）：本地自治主链路下直接踢，白名单才真正生效。
         // 注意：直接用 %s 展示原因，不走 %T 翻译，避免翻译文件未更新时
         // KickClient 抛异常导致「判定拒绝却没有真正踢出」。
         LogAccessEvent("kick", "rules denied (local snapshot)");
         ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
         MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
         KickClient(client, "%s", denyReason);
-        // 资料未验证：触发一次立即快照刷新，配合后端拒绝驱动的资料强刷加速自愈
-        // （拒绝上报本身会触发后端强制复核，快照刷新让新鲜资料尽快到达插件）。
-        if (StrEqual(denyFailureCode, "profile_missing"))
-        {
-            RequestAccessSnapshotRefresh(true);
-        }
         return;
     }
 
@@ -152,6 +167,79 @@ void LocalAccessFallback(int client)
     ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
     RequestAccessSnapshotRefresh(true);
     return;
+}
+
+/**
+ * 资料未验证宽限到期后的延迟复核（每连接最多两次）。
+ * 首次复核时若仍未验证：再触发一次快照刷新并约 15s 后做最终复核，覆盖
+ * 后端外部拉取较慢 + 插件 30s 拉取相位错开的最坏情况；
+ * 宽限内快照已追平（后端强刷 + 快照刷新已在放行时触发）→ 留服；
+ * 最终仍未验证或确认不达标 → 踢出。达标玩家一次即进，无需重进。
+ */
+public Action Timer_AccessMissingRecheck(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+
+    char steamId[64];
+    char ipAddress[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        return Plugin_Stop;
+    }
+    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+
+    char reason[256];
+    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
+    {
+        LogAccessEvent("kick", "grace recheck: banned");
+        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
+        MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
+        KickClient(client, "%T", "Kick Banned Message", client, reason);
+        return Plugin_Stop;
+    }
+
+    char allowMethod[32];
+    char denyMethod[32];
+    char denyFailureCode[48];
+    char denyReason[256];
+    LocalRuleDecision decision = OfflineEvaluateRules(steamId, ipAddress, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+    if (decision == LocalRule_Allow)
+    {
+        LogAccessEvent("allow", "grace recheck: snapshot synced");
+        ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
+        return Plugin_Stop;
+    }
+    // 首次复核仍未验证：给慢链路一次跟进机会，不直接踢
+    if (decision == LocalRule_Deny && StrEqual(denyFailureCode, "profile_missing")
+        && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 1)
+    {
+        g_AccessMissingDeferred[client] = 2;
+        LogAccessEvent("allow", "profile still missing, follow-up recheck scheduled");
+        RequestAccessSnapshotRefresh(true);
+        CreateTimer(15.0, Timer_AccessMissingRecheck, userid, TIMER_FLAG_NO_MAPCHANGE);
+        return Plugin_Stop;
+    }
+    if (decision == LocalRule_Deny)
+    {
+        LogAccessEvent("kick", "grace recheck: still denied");
+        ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, denyReason);
+        KickClient(client, "%s", denyReason);
+        return Plugin_Stop;
+    }
+
+    if (!ShouldFailOpenAccessCheck())
+    {
+        LogAccessEvent("kick", "grace recheck: rules unavailable, fail_closed");
+        ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
+        KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
+    }
+    return Plugin_Stop;
 }
 
 /**
@@ -1388,7 +1476,8 @@ Action CommandAccessStatus(int admin, int args)
     }
 
     ReplyToCommand(admin, "[LumiAdmin-Access] ---- status ----");
-    ReplyToCommand(admin, "[LumiAdmin-Access] mode: local sync decide (grace=0), events reconcile");
+    ReplyToCommand(admin, "[LumiAdmin-Access] mode: local sync decide (missing-grace %.0fs), events reconcile",
+        (g_AccessMissingGrace == null) ? 25.0 : g_AccessMissingGrace.FloatValue);
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot db: %s", g_AccessSnapshotDb == null ? "UNAVAILABLE" : "ok");
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot age: %ds (stale snapshots still usable as fallback)", snapshotAge < 0 ? -1 : snapshotAge);
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot version: '%s' last ok refresh: %ds ago",

@@ -14,6 +14,8 @@ void Server_OnPluginStart()
         "本地快照完全不可用（无法裁决）时是否放行玩家。", _, true, 0.0, true, 1.0);
     g_AccessCheckTimeout = CreateConVar("server_access_check_timeout", DEFAULT_ACCESS_CHECK_TIMEOUT,
         "快照刷新/补偿请求超时（秒）。", _, true, 2.0, true, 30.0);
+    g_AccessMissingGrace = CreateConVar("server_access_missing_grace", DEFAULT_ACCESS_MISSING_GRACE,
+        "资料未验证（profile_missing）时延迟复核的宽限（秒）；宽限内快照追平即放行，到期仍未验证才踢出。0 表示立即踢出（旧行为）。", _, true, 0.0, true, 120.0);
     g_AuthEventsInterval = CreateConVar("server_auth_events_interval", DEFAULT_AUTH_EVENTS_INTERVAL,
         "授权事件 Long-Poll 间隔（秒，插件侧看门狗周期；后端 hold≤20s）。", _, true, 5.0, true, 120.0);
 
