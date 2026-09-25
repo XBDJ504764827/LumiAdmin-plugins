@@ -3,7 +3,8 @@
  *
  * - OnClientAuthorized 内同步读本地 SQLite（含内存规则），命中封禁/白名单缺失/
  *   确认的门槛不足即立即 Kick，不等待任何 HTTP；
- * - 资料未验证（profile_missing，即快照尚无该玩家资料≠不达标）则先放行并延迟复核
+ * - 限制侧软失败（profile_missing 缺资料 / low_rating-low_steam_level 旧快照低分，
+ *   即“玩家可能刚达标、快照还没追上”）则先放行并延迟复核
  *   （server_access_missing_grace 秒，默认 25s）：宽限内快照追平即留服，到期仍未
  *   验证/确认不达标才踢出。达标玩家一次即进，不再需要重进两三次；
  * - /access/check 在线复核已退役为主链路，仅保留后台对账（auth_sync 恢复后全服复核补踢）；
@@ -46,6 +47,19 @@ public void OnClientAuthorized(int client, const char[] auth)
 void LocalAccessDecide(int client)
 {
     LocalAccessFallback(client);
+}
+
+/**
+ * 限制侧软失败：快照缺资料（profile_missing）或快照资料为旧低分
+ * （low_rating / low_steam_level，快照 30s 拉取 + 后端强刷节流导致）。
+ * 这类拒绝可能是“玩家刚达标、快照还没追上”，走宽限延迟复核而非立即踢；
+ * 封禁 / 白名单缺失 / 中高风险等硬拒绝不在此列，仍立即踢出。
+ */
+bool IsGraceableRestrictionDeny(const char[] failureCode)
+{
+    return StrEqual(failureCode, "profile_missing")
+        || StrEqual(failureCode, "low_rating")
+        || StrEqual(failureCode, "low_steam_level");
 }
 
 // =====[ 在线复核层（已退役为主链路，仅后台对账保留；进服用 LocalAccessDecide）]=====
@@ -129,22 +143,23 @@ void LocalAccessFallback(int client)
 
     if (decision == LocalRule_Deny)
     {
-        // 资料未验证：先上报本次拒绝（触发后端强制复核资料强刷），再立即刷新快照，
-        // 随后按宽限延迟复核。快照追平即留服，玩家一次即进，无需重进。
-        if (StrEqual(denyFailureCode, "profile_missing"))
+        // 限制侧软失败（缺资料/旧低分）：先上报本次拒绝（触发后端强制复核资料强刷），
+        // 再立即刷新快照，随后按宽限延迟复核。快照追平即留服，玩家一次即进，无需重进。
+        if (IsGraceableRestrictionDeny(denyFailureCode))
         {
             RequestAccessSnapshotRefresh(true);
             float grace = (g_AccessMissingGrace == null) ? 25.0 : g_AccessMissingGrace.FloatValue;
             if (grace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
             {
                 g_AccessMissingDeferred[client] = 1;
-                LogAccessEvent("allow", "profile missing, grace recheck scheduled");
+                LogAccessEvent("allow", "restriction soft-deny, grace recheck scheduled");
                 ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
                 CreateTimer(grace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
                 return;
             }
         }
-        // 明确不满足白名单/门槛（或宽限已用过/已关闭）：本地自治主链路下直接踢，白名单才真正生效。
+        // 硬拒绝（封禁/白名单缺失/中高风险/确认不达标且宽限已用过或已关闭）：
+        // 本地自治主链路下直接踢，白名单才真正生效。
         // 注意：直接用 %s 展示原因，不走 %T 翻译，避免翻译文件未更新时
         // KickClient 抛异常导致「判定拒绝却没有真正踢出」。
         LogAccessEvent("kick", "rules denied (local snapshot)");
@@ -170,9 +185,9 @@ void LocalAccessFallback(int client)
 }
 
 /**
- * 资料未验证宽限到期后的延迟复核（每连接最多两次）。
- * 首次复核时若仍未验证：再触发一次快照刷新并约 15s 后做最终复核，覆盖
- * 后端外部拉取较慢 + 插件 30s 拉取相位错开的最坏情况；
+ * 限制侧宽限到期后的延迟复核（每连接最多两次）。
+ * 首次复核时若仍是软失败（缺资料/旧低分）：再触发一次快照刷新并约 15s 后做最终复核，
+ * 覆盖后端外部拉取较慢 + 插件 30s 拉取相位错开的最坏情况；
  * 宽限内快照已追平（后端强刷 + 快照刷新已在放行时触发）→ 留服；
  * 最终仍未验证或确认不达标 → 踢出。达标玩家一次即进，无需重进。
  */
@@ -213,12 +228,12 @@ public Action Timer_AccessMissingRecheck(Handle timer, int userid)
         ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
         return Plugin_Stop;
     }
-    // 首次复核仍未验证：给慢链路一次跟进机会，不直接踢
-    if (decision == LocalRule_Deny && StrEqual(denyFailureCode, "profile_missing")
+    // 首次复核仍是软失败：给慢链路一次跟进机会，不直接踢
+    if (decision == LocalRule_Deny && IsGraceableRestrictionDeny(denyFailureCode)
         && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 1)
     {
         g_AccessMissingDeferred[client] = 2;
-        LogAccessEvent("allow", "profile still missing, follow-up recheck scheduled");
+        LogAccessEvent("allow", "restriction soft-deny persists, follow-up recheck scheduled");
         RequestAccessSnapshotRefresh(true);
         CreateTimer(15.0, Timer_AccessMissingRecheck, userid, TIMER_FLAG_NO_MAPCHANGE);
         return Plugin_Stop;

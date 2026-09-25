@@ -72,7 +72,7 @@ int g_UnbanAdminUserId = 0;
 char g_DisconnectReason[MAXPLAYERS + 1][32];
 char g_DisconnectDetail[MAXPLAYERS + 1][256];
 
-// 资料未验证（profile_missing）延迟复核状态：0 未延期，1 宽限待复核，2 跟进复核待决
+// 限制侧软失败延迟复核状态：0 未延期，1 宽限待复核，2 跟进复核待决
 int g_AccessMissingDeferred[MAXPLAYERS + 1];
 // 快照增量同步与退避状态
 char g_AccessSnapshotEtag[MAX_ACCESS_SNAPSHOT_ETAG];
