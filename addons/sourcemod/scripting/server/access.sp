@@ -5,7 +5,7 @@
  *   确认的门槛不足即立即 Kick，不等待任何 HTTP；
  * - 限制侧软失败（profile_missing 缺资料 / low_rating-low_steam_level 旧快照低分，
  *   即“玩家可能刚达标、快照还没追上”）则先放行并点查直取
- *   （POST /api/plugin/access/profile，server_access_missing_grace 秒，默认 3s）：
+ *   （POST /api/plugin/access/profile，server_access_missing_grace 秒，默认 7s）：
  *   点查早到即提前裁决，宽限到期做最终裁决（零容忍：仍未验证/确认不达标即踢）。
  *   未达标玩家在服内最多存在宽限时长；
  * - /access/check 在线复核已退役为主链路，仅保留后台对账（auth_sync 恢复后全服复核补踢）；
@@ -168,7 +168,7 @@ void LocalAccessFallback(int client)
         // （达标 1s 内确认，不用等满宽限），宽限定时器做最终裁决（零容忍）。
         if (IsGraceableRestrictionDeny(denyFailureCode))
         {
-            float grace = (g_AccessMissingGrace == null) ? 3.0 : g_AccessMissingGrace.FloatValue;
+            float grace = (g_AccessMissingGrace == null) ? 7.0 : g_AccessMissingGrace.FloatValue;
             if (grace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
             {
                 g_AccessMissingDeferred[client] = 1;
