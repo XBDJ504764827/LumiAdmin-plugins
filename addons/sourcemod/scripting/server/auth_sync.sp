@@ -33,6 +33,12 @@ void AuthSync_Stop()
 public Action Timer_AuthEventsPoll(Handle timer)
 {
     AuthSync_PollOnce();
+    // PollOnce 在不可达时会删掉本句柄另起看门狗：此时必须 Stop，
+    // 否则引擎用已删除句柄重排并报 Invalid timer handle。
+    if (timer != g_AuthEventsTimer)
+    {
+        return Plugin_Stop;
+    }
     return Plugin_Continue;
 }
 

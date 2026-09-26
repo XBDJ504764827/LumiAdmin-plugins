@@ -103,6 +103,26 @@ void LocalAccessFallback(int client)
         return;
     }
 
+    // 从未同步成功：本地白名单/资料表可能是空的，无裁决依据 → 按 fail_open 口径，
+    // 避免后端部署窗口/新装首启把所有人（含白名单玩家）挡在门外要求重进。
+    // 注：取 token 失败时 core 侧已异步触发自动识别；首次同步成功后由
+    // OnAccessSnapshotResponse 调用 AuthReconcileOnlinePlayers 补踢。
+    if (!LocalSnapshotEverSynced())
+    {
+        if (!ShouldFailOpenAccessCheck())
+        {
+            LogAccessEvent("kick", "never synced, fail_closed");
+            ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "snapshot_missing", "访问控制服务暂时不可用。");
+            MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "访问控制服务暂时不可用。");
+            KickClient(client, "%T", "Access Service Unavailable", client);
+            return;
+        }
+        LogAccessEvent("allow", "never synced, fail_open");
+        ReportAccessDecision(client, steamId, ipAddress, true, "snapshot_fallback", "", "");
+        RequestAccessSnapshotRefresh(true);
+        return;
+    }
+
     char reason[256];
     if (hasAuth && FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
     {
@@ -806,6 +826,25 @@ void RefreshAccessSnapshot()
 }
 
 /**
+ * 本地快照是否曾经同步成功（metadata.version 有值，SQLite 持久化，重启不丢）。
+ * false = 白名单/资料表可能是空的，无裁决依据，进服走 fail_open 兜底而非直接踢。
+ */
+bool LocalSnapshotEverSynced()
+{
+    if (g_AccessSnapshotDb == null)
+    {
+        return false;
+    }
+
+    char version[128];
+    if (!GetMetadataValue("version", version, sizeof(version)))
+    {
+        return false;
+    }
+    return version[0] != '\0';
+}
+
+/**
  * 本地规则表是否已写入（server_rules 有 id=1 行）。
  * 用于决定快照刷新是否可走 etag 增量。
  */
@@ -869,9 +908,16 @@ public void OnAccessSnapshotResponse(HTTPResponse response, any value, const cha
         return;
     }
 
+    bool wasSynced = LocalSnapshotEverSynced();
     SaveAccessSnapshot(item);
     delete item;
     delete root;
+    // 首启/部署窗口内放行过的玩家：首次同步成功后立即比对补踢
+    if (!wasSynced && LocalSnapshotEverSynced())
+    {
+        LogAccessEvent("snapshot", "first sync, reconciling online players");
+        AuthReconcileOnlinePlayers();
+    }
 }
 
 void SnapshotRefreshFailed(const char[] cause, const char[] detail)
