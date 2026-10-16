@@ -104,6 +104,8 @@ server.cfg:
     server_status_interval        "30.0"
     server_access_snapshot_interval "300.0"
     server_access_fail_open       "1"
+    server_access_missing_grace   "7.0"
+    server_access_whitelist_grace "7.0"
     server_debug                  "0"
 ```
 
@@ -130,6 +132,8 @@ sync / recordguard 无配置文件，convar 使用合理默认值，需要时可
 | `POST /api/plugin/access/check` | 后台对账/兼容 | 进服权限检查（本地自治后主链路不再调用） |
 | `POST /api/plugin/access/record` | 玩家授权后本地裁决完成 | 上报本地进服裁决结果（供后台「进服监控」展示） |
 | `POST /api/plugin/access/snapshot` | 每 `server_access_snapshot_interval` 秒 | 拉取权限快照写入本地 SQLite（断网应急） |
+| `POST /api/plugin/access/profile` | 限制软失败宽限开始时 | 单玩家资料点查（有界拉取约 2s），命中写本地表并提前复核 |
+| `POST /api/plugin/access/whitelist/live` | 白名单缺失宽限开始时 | 单玩家白名单实时点查（直查 DB），已通过写本地表并提前复核，有效封禁提前踢出 |
 
 ### 4.3 sync
 
