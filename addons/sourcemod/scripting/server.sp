@@ -33,6 +33,7 @@ native int Sync_GetPendingCount();
 #define DEFAULT_ACCESS_FAIL_OPEN "1"
 #define DEFAULT_ACCESS_CHECK_TIMEOUT "5.0"
 #define DEFAULT_ACCESS_MISSING_GRACE "7.0"
+#define DEFAULT_ACCESS_WHITELIST_GRACE "7.0"
 #define DEFAULT_AUTH_EVENTS_INTERVAL "25.0"
 #define AUTH_SNAPSHOT_VERSION_GAP 500
 #define ACCESS_SNAPSHOT_DB "lumiadmin_access_snapshot"
@@ -48,6 +49,7 @@ ConVar g_DebugLog;
 ConVar g_AccessFailOpen;
 ConVar g_AccessCheckTimeout;
 ConVar g_AccessMissingGrace;
+ConVar g_AccessWhitelistGrace;
 ConVar g_CpuUsageCvar;
 ConVar g_HostPortCvar = null;
 ConVar g_TickrateCvar = null;

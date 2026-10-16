@@ -1,12 +1,15 @@
 /**
  * 进服权限检查：本地同步裁决（LumiAuth Data Plane）。
  *
- * - OnClientAuthorized 内同步读本地 SQLite（含内存规则），命中封禁/白名单缺失/
- *   确认的门槛不足即立即 Kick，不等待任何 HTTP；
+ * - OnClientAuthorized 内同步读本地 SQLite（含内存规则），命中封禁/
+ *   中高风险/确认的门槛不足即立即 Kick，不等待任何 HTTP；
  * - 限制侧软失败（profile_missing 缺资料 / low_rating-low_steam_level 旧快照低分，
  *   即“玩家可能刚达标、快照还没追上”）则先放行并点查直取
- *   （POST /api/plugin/access/profile，server_access_missing_grace 秒，默认 7s）：
- *   点查早到即提前裁决，宽限到期做最终裁决（零容忍：仍未验证/确认不达标即踢）。
+ *   （POST /api/plugin/access/profile，server_access_missing_grace 秒，默认 7s）；
+ * - 白名单软失败（not_whitelisted，即“玩家可能刚通过、事件/快照还没追上”）
+ *   则先放行并实时回源（POST /api/plugin/access/whitelist/live，直查 DB，
+ *   server_access_whitelist_grace 秒，默认 7s）；
+ *   回源早到即提前裁决，宽限到期做最终裁决（零容忍：仍未验证/确认不达标即踢）。
  *   未达标玩家在服内最多存在宽限时长；
  * - /access/check 在线复核已退役为主链路，仅保留后台对账（auth_sync 恢复后全服复核补踢）；
  * - 熔断器保留用于后台补偿链路（快照刷新/ban poll），不再阻塞进服。
@@ -61,6 +64,17 @@ bool IsGraceableRestrictionDeny(const char[] failureCode)
     return StrEqual(failureCode, "profile_missing")
         || StrEqual(failureCode, "low_rating")
         || StrEqual(failureCode, "low_steam_level");
+}
+
+/**
+ * 白名单软失败：快照无白名单（not_whitelisted），即“玩家可能刚通过、
+ * 授权事件/快照还没追上”。走宽限延迟复核而非立即踢：先放行并实时回源
+ * （POST /api/plugin/access/whitelist/live，直查 DB 不读快照），命中即留服，
+ * 宽限到期仍未通过即踢（零容忍）。封禁 / 中高风险等硬拒绝不在此列。
+ */
+bool IsGraceableWhitelistDeny(const char[] failureCode)
+{
+    return StrEqual(failureCode, "not_whitelisted");
 }
 
 // =====[ 在线复核层（已退役为主链路，仅后台对账保留；进服用 LocalAccessDecide）]=====
@@ -164,17 +178,43 @@ void LocalAccessFallback(int client)
 
     if (decision == LocalRule_Deny)
     {
-        // 限制侧软失败（缺资料/旧低分）：点查直取 + 宽限终裁。点查回调早到即提前裁决
-        // （达标 1s 内确认，不用等满宽限），宽限定时器做最终裁决（零容忍）。
-        if (IsGraceableRestrictionDeny(denyFailureCode))
+        // 软失败宽限（双轨）：限制侧缺资料/旧低分走资料点查，白名单缺失走白名单
+        // 实时回源。回源早到即提前裁决，宽限定时器做最终裁决（零容忍）。
+        // 组合拒绝（白名单缺失 + 资料软失败）时两条回源同时触发。
+        bool restrictionGrace = IsGraceableRestrictionDeny(denyFailureCode);
+        bool whitelistGrace = IsGraceableWhitelistDeny(denyFailureCode);
+        if (restrictionGrace || whitelistGrace)
         {
-            float grace = (g_AccessMissingGrace == null) ? 7.0 : g_AccessMissingGrace.FloatValue;
+            float missingGrace = (g_AccessMissingGrace == null) ? 7.0 : g_AccessMissingGrace.FloatValue;
+            float wlGrace = (g_AccessWhitelistGrace == null) ? 7.0 : g_AccessWhitelistGrace.FloatValue;
+            float grace = missingGrace;
+            if (whitelistGrace && (!restrictionGrace || wlGrace > grace))
+            {
+                grace = wlGrace;
+            }
+            // 组合拒绝：限制码下本地白名单若也缺失，同样触发白名单回源
+            bool needWlLive = whitelistGrace;
+            if (!needWlLive && restrictionGrace && SnapshotHasRule("whitelist_mode_enabled") && !OfflineWhitelistContains(steamId))
+            {
+                needWlLive = true;
+                if (wlGrace > grace)
+                {
+                    grace = wlGrace;
+                }
+            }
             if (grace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
             {
                 g_AccessMissingDeferred[client] = 1;
-                LogAccessEvent("allow", "restriction soft-deny, point query + grace recheck");
+                LogAccessEvent("allow", "soft-deny, live recheck + grace");
                 ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
-                RequestPlayerProfile(client, steamId);
+                if (restrictionGrace)
+                {
+                    RequestPlayerProfile(client, steamId);
+                }
+                if (needWlLive)
+                {
+                    RequestWhitelistLiveCheck(client, steamId);
+                }
                 RequestAccessSnapshotRefresh(true);
                 CreateTimer(grace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
                 return;
@@ -378,6 +418,112 @@ public void OnAccessProfileResponse(HTTPResponse response, any value, const char
     }
     // 点查早到：立即复核，不用等满宽限；仍是软失败则等定时器终裁
     RecheckAccessAfterProfile(client, "grace recheck: point query hit", false);
+}
+
+/**
+ * 白名单实时回源（宽限开始时触发，异步，不阻塞进服）。
+ * 后端直查 DB 不读快照：已通过即写本地白名单表并提前复核；有效封禁即提前踢出；
+ * 未通过则什么都不做，等宽限定时器按零容忍终裁。
+ */
+void RequestWhitelistLiveCheck(int client, const char[] steamId)
+{
+    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
+    {
+        return;
+    }
+
+    char url[512];
+    char token[256];
+    if (!ResolvePluginApiConfig(url, sizeof(url), "/access/whitelist/live", token, sizeof(token)))
+    {
+        return;
+    }
+
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        return;
+    }
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", currentPort);
+    payload.SetString("steam_id64", steamId);
+
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamId);
+    PostJsonObject(url, payload, OnWhitelistLiveResponse, pack, g_AccessCheckTimeout.FloatValue);
+    delete payload;
+}
+
+public void OnWhitelistLiveResponse(HTTPResponse response, any value, const char[] error)
+{
+    DataPack pack = view_as<DataPack>(value);
+    int userid = 0;
+    char steamId[64];
+    steamId[0] = '\0';
+    if (pack != null)
+    {
+        pack.Reset();
+        userid = pack.ReadCell();
+        pack.ReadString(steamId, sizeof(steamId));
+        delete pack;
+    }
+    if (error[0] != '\0' || response.Status != HTTPStatus_OK)
+    {
+        // 回源失败/超时：宽限定时器会按零容忍终裁，这里只记日志
+        LogHttpPostFailure("whitelist live check", response, error);
+        return;
+    }
+
+    JSONObject root = view_as<JSONObject>(response.Data);
+    if (root == null)
+    {
+        return;
+    }
+    JSONObject item = view_as<JSONObject>(root.Get("item"));
+    if (item == null)
+    {
+        delete root;
+        return;
+    }
+    bool whitelisted = LumiJsonGetBool(item, "whitelisted");
+    bool banned = LumiJsonGetBool(item, "banned");
+    char banReason[256];
+    item.GetString("reason", banReason, sizeof(banReason));
+    delete item;
+    delete root;
+
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return;
+    }
+
+    if (banned)
+    {
+        // 回源发现有效封禁：不等宽限到期，立即踢出
+        if (banReason[0] == '\0')
+        {
+            strcopy(banReason, sizeof(banReason), "你已被封禁。");
+        }
+        char ipAddress[64];
+        GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+        LogAccessEvent("kick", "grace recheck: live banned");
+        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", banReason);
+        MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, banReason);
+        KickClient(client, "%s", banReason);
+        return;
+    }
+
+    if (whitelisted)
+    {
+        // 回源已通过：直接合并进本地白名单表并提前复核，不用等宽限到期
+        AuthUpsertWhitelist(steamId, "", 0);
+        RecheckAccessAfterProfile(client, "grace recheck: whitelist live hit", false);
+    }
+    // 未通过：什么都不做，等宽限定时器终裁
 }
 
 /**
@@ -1659,8 +1805,9 @@ Action CommandAccessStatus(int admin, int args)
     }
 
     ReplyToCommand(admin, "[LumiAdmin-Access] ---- status ----");
-    ReplyToCommand(admin, "[LumiAdmin-Access] mode: local sync decide (missing-grace %.0fs), events reconcile",
-        (g_AccessMissingGrace == null) ? 25.0 : g_AccessMissingGrace.FloatValue);
+    ReplyToCommand(admin, "[LumiAdmin-Access] mode: local sync decide (missing-grace %.0fs, whitelist-grace %.0fs), events reconcile",
+        (g_AccessMissingGrace == null) ? 25.0 : g_AccessMissingGrace.FloatValue,
+        (g_AccessWhitelistGrace == null) ? 7.0 : g_AccessWhitelistGrace.FloatValue);
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot db: %s", g_AccessSnapshotDb == null ? "UNAVAILABLE" : "ok");
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot age: %ds (stale snapshots still usable as fallback)", snapshotAge < 0 ? -1 : snapshotAge);
     ReplyToCommand(admin, "[LumiAdmin-Access] snapshot version: '%s' last ok refresh: %ds ago",
