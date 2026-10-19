@@ -49,6 +49,13 @@ void AuthSync_PollOnce()
         return;
     }
 
+    // 节点同步：同一台机器只有一个 leader 轮询并写入共享 SQLite，
+    // 其余进程只读共享库做本地裁决，避免 N 台服重复拉取与并发写库。
+    if (!AccessSync_TryAcquireLease(AccessSyncLeaseTtl()))
+    {
+        return;
+    }
+
     char token[MAX_SERVER_TOKEN];
     char url[512];
     int currentPort = 0;
@@ -109,7 +116,7 @@ public void OnAuthEventsResponse(HTTPResponse response, any value, const char[] 
     bool snapshotRequired = LumiJsonGetBool(root, "snapshot_required");
     int latestVersion = LumiJsonGetInt(root, "latest_version");
 
-    if (snapshotRequired || (latestVersion - g_AuthLastAppliedVersion) > AUTH_SNAPSHOT_VERSION_GAP)
+    if (snapshotRequired)
     {
         LogMessage("[LumiAuth] Snapshot required (applied=%d latest=%d).", g_AuthLastAppliedVersion, latestVersion);
         LogAccessEvent("snapshot", "required by version gap");
@@ -149,16 +156,6 @@ public void OnAuthEventsResponse(HTTPResponse response, any value, const char[] 
             delete ev;
             continue;
         }
-        if (version != g_AuthLastAppliedVersion + 1)
-        {
-            LogMessage("[LumiAuth] Version gap detected (applied=%d got=%d), requesting resync.", g_AuthLastAppliedVersion, version);
-            delete ev;
-            delete events;
-            delete root;
-            AuthSync_RequestSnapshot();
-            return;
-        }
-
         JSONObject payload = view_as<JSONObject>(ev.Get("payload"));
         AuthSync_ApplyEvent(eventId, version, eventType, payload);
         if (payload != null)
@@ -207,13 +204,9 @@ void AuthSync_ApplyEvent(const char[] eventId, int version, const char[] eventTy
 
     if (StrEqual(eventType, "ban.add"))
     {
-        int expiresAt = 0;
-        char expiresText[64];
-        if (payload.GetString("expires_at", expiresText, sizeof(expiresText)) && expiresText[0] != '\0')
-        {
-            // 后端 RFC3339；插件侧无法解析则视为永久（由补偿 snapshot 纠正精确值）
-            expiresAt = 0;
-        }
+        // 后端直接下发 unix 时间戳，避免插件解析 RFC3339；缺失时按永久处理，
+        // 下一次快照会带回精确值。
+        int expiresAt = LumiJsonGetInt(payload, "expires_at_unix");
         if (reason[0] == '\0')
         {
             strcopy(reason, sizeof(reason), "封禁");
@@ -228,7 +221,7 @@ void AuthSync_ApplyEvent(const char[] eventId, int version, const char[] eventTy
     }
     else if (StrEqual(eventType, "ban.remove"))
     {
-        if (AuthRemoveLocalBan(steamId, eventId, version))
+        if (AuthRemoveLocalBan(steamId, ip, eventId, version))
         {
             LogMessage("[LumiAuth] Applying event %d (%s).", version, eventType);
             LogAccessEvent("event", eventType);
@@ -473,7 +466,8 @@ Action CommandApplyBanFastPath(int args)
 
     // 1) 先落本地 Ban（幂等 eventId=ban_id，避免快车道与事件双写重复）
     char eventId[128];
-    Format(eventId, sizeof(eventId), "fastpath:%s", banId);
+    // 与解封快车道使用不同的幂等键，否则解封会命中「已应用」而跳过删除。
+    Format(eventId, sizeof(eventId), "fastpath:ban:%s", banId);
     if (!AuthUpsertLocalBan(steamId, "", reason, expiresAt, eventId, version))
     {
         LogError("[LumiAuth] lumiadmin_apply_ban: local persist failed for %s.", steamId);
@@ -511,8 +505,9 @@ Action CommandApplyUnbanFastPath(int args)
 
     int version = StringToInt(versionText);
     char eventId[128];
-    Format(eventId, sizeof(eventId), "fastpath:%s", banId);
-    AuthRemoveLocalBan(steamId, eventId, version);
+    // 与封禁快车道区分，避免 AuthEventAlreadyApplied 命中后跳过删除。
+    Format(eventId, sizeof(eventId), "fastpath:unban:%s", banId);
+    AuthRemoveLocalBan(steamId, "", eventId, version);
     if (version > 0)
     {
         AuthPersistAppliedVersion(version);
