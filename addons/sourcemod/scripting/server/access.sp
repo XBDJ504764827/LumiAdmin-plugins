@@ -984,6 +984,39 @@ bool AccessSync_TryAcquireLease(int ttlSeconds)
     }
     return acquired;
 }
+void AuthSync_Ack(int version)
+{
+    char token[MAX_SERVER_TOKEN];
+    char url[512];
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        return;
+    }
+    if (!ResolvePluginApiConfig(url, sizeof(url), "/auth/ack", token, sizeof(token)))
+    {
+        return;
+    }
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", currentPort);
+    payload.SetInt("version", version);
+    PostJsonObject(url, payload, OnAuthAckResponse, version, 10.0);
+    delete payload;
+    LogMessage("[LumiAuth] ACK %d.", version);
+}
+
+public void OnAuthAckResponse(HTTPResponse response, any value, const char[] error)
+{
+    if (error[0] != '\0' || response.Status < HTTPStatus_OK || response.Status >= HTTPStatus_MultipleChoices)
+    {
+        LogMessage("[LumiAuth] ACK %d failed, will re-ack on next poll.", value);
+        return;
+    }
+}
+
+
 void StartAccessSnapshotTimer()
 {
     StopAccessSnapshotTimer();
@@ -1175,9 +1208,19 @@ public void OnAccessSnapshotResponse(HTTPResponse response, any value, const cha
     }
 
     bool wasSynced = LocalSnapshotEverSynced();
-    SaveAccessSnapshot(item);
+    bool saved = SaveAccessSnapshot(item);
     delete item;
     delete root;
+    if (!saved)
+    {
+        SnapshotRefreshFailed("snapshot save failed", "");
+        return;
+    }
+    // 快照成功写入后同步 ACK 节点版本，避免「本地已应用但网站仍显示落后」。
+    if (g_AuthLastAppliedVersion > 0)
+    {
+        AuthSync_Ack(g_AuthLastAppliedVersion);
+    }
     // 首启/部署窗口内放行过的玩家：首次同步成功后立即比对补踢
     if (!wasSynced && LocalSnapshotEverSynced())
     {
@@ -1520,6 +1563,15 @@ void AuthReconcileOnlinePlayers()
  */
 bool SnapshotIsOlderThanLocal(JSONObject item)
 {
+    // 事件版本单调保护：快照构建时的节点版本若落后于本地已应用的事件版本，
+    // 说明它可能是解封/加白名单之前构建的旧快照，直接拒绝，避免把刚解除的封禁写回来。
+    int snapshotVersion = LumiJsonGetInt(item, "latest_version");
+    if (snapshotVersion > 0 && snapshotVersion < g_AuthLastAppliedVersion)
+    {
+        LogError("[LumiAdmin-Access] access snapshot: stale by event version (snapshot=%d applied=%d), ignored.", snapshotVersion, g_AuthLastAppliedVersion);
+        return true;
+    }
+
     char existing[32];
     if (!GetMetadataValue("generated_at_unix", existing, sizeof(existing)) || existing[0] == '\0')
     {
@@ -1733,7 +1785,12 @@ bool SaveAccessSnapshot(JSONObject item)
     g_AccessSnapshotBackoffStep = 0;
     g_AccessSnapshotLastRefreshOk = GetTime();
     strcopy(g_AccessSnapshotEtag, sizeof(g_AccessSnapshotEtag), version);
-    LogMessage("[LumiAdmin-Access] snapshot refreshed: version '%s', bans/whitelist/profiles/risk_ips updated.", version);
+    int snapshotVersion = LumiJsonGetInt(item, "latest_version");
+    if (snapshotVersion > 0)
+    {
+        AuthPersistAppliedVersion(snapshotVersion);
+    }
+    LogMessage("[LumiAdmin-Access] snapshot refreshed: version '%s' (event version %d), bans/whitelist/profiles/risk_ips updated.", version, snapshotVersion);
     return true;
 }
 
