@@ -618,8 +618,10 @@ LocalRuleDecision OfflineEvaluateRules(
         meetsRestriction = profileCheck == ProfileCheck_Meets;
     }
 
-    // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效封禁账号关联 → 拒绝
-    if (riskBlockEnabled && !(whitelistModeEnabled && hasWhitelist) && OfflineIpHasRisk(ipAddress))
+    // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效封禁账号关联 → 拒绝。
+    // 刚解封的 Steam 在短窗口内豁免，避免快照 risk_ips 尚未追平时又被拦回去。
+    bool riskExempt = IsRiskExempt(steamId);
+    if (riskBlockEnabled && !riskExempt && !(whitelistModeEnabled && hasWhitelist) && OfflineIpHasRisk(ipAddress))
     {
         strcopy(denyMethod, denyMethodMaxLen, "risk_blocked");
         strcopy(denyFailureCode, failMaxLen, "risk_blocked");
@@ -774,6 +776,57 @@ bool OfflineWhitelistContains(const char[] steamId)
     bool found = SQL_FetchRow(results);
     delete results;
     return found;
+}
+
+// 解封后的短期风险拦截豁免（避免快照未追平前再次被 risk_ips 拦截）
+bool IsRiskExempt(const char[] steamId)
+{
+    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
+    {
+        return false;
+    }
+    char escapedSteam[128];
+    char query[256];
+    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
+    Format(query, sizeof(query), "SELECT expires_at FROM risk_exempt WHERE steam_id = '%s' LIMIT 1", escapedSteam);
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
+    if (results == null)
+    {
+        return false;
+    }
+    bool exempt = false;
+    if (SQL_FetchRow(results))
+    {
+        exempt = SQL_FetchInt(results, 0) > GetTime();
+    }
+    delete results;
+    return exempt;
+}
+
+void MarkRiskExempt(const char[] steamId, int seconds)
+{
+    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
+    {
+        return;
+    }
+    char escapedSteam[128];
+    char query[256];
+    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
+    Format(query, sizeof(query), "INSERT OR REPLACE INTO risk_exempt (steam_id, expires_at) VALUES ('%s', %d)", escapedSteam, GetTime() + seconds);
+    SQL_FastQuery(g_AccessSnapshotDb, query);
+}
+
+void ClearRiskExempt(const char[] steamId)
+{
+    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
+    {
+        return;
+    }
+    char escapedSteam[128];
+    char query[256];
+    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
+    Format(query, sizeof(query), "DELETE FROM risk_exempt WHERE steam_id = '%s'", escapedSteam);
+    SQL_FastQuery(g_AccessSnapshotDb, query);
 }
 
 // 当前 IP 是否与「当前有效封禁账号」关联（快照 risk_ips 集合，供 risk_block 使用）
@@ -1284,6 +1337,10 @@ void InitAccessSnapshotDb()
     // 节点同步租约：同一台机器上只有一个进程（leader）轮询网站并写库，其余进程只读共享库。
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS sync_lease (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS risk_ips (ip TEXT PRIMARY KEY)");
+    // 解封后的短期豁免：解封事件只删 bans，但快照里的 risk_ips 仍可能包含该玩家 IP，
+    // 导致解封后仍被「中高风险 IP」拦截。这里给刚解封的 Steam 一个短期豁免，
+    // 等下一次新鲜快照确认该 IP 已不再关联有效封禁后自然恢复。
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS risk_exempt (steam_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS bans (steam_id TEXT, ip_address TEXT, reason TEXT NOT NULL, expires_at INTEGER)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS whitelist (steam_id TEXT PRIMARY KEY)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS access_profiles (steam_id TEXT PRIMARY KEY, rating INTEGER NOT NULL, steam_level INTEGER NOT NULL, expires_at INTEGER NOT NULL)");
@@ -1346,6 +1403,8 @@ bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char
     SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIp, sizeof(escapedIp));
     SQL_EscapeString(g_AccessSnapshotDb, reason, escapedReason, sizeof(escapedReason));
 
+    ClearRiskExempt(steamId);
+
     char query[1024];
     Format(query, sizeof(query), "INSERT OR IGNORE INTO bans (steam_id, ip_address, reason, expires_at) VALUES ('%s', '%s', '%s', %d)",
         escapedSteamId, escapedIp, escapedReason, expiresAt);
@@ -1405,6 +1464,9 @@ bool AuthRemoveLocalBan(const char[] steamId, const char[] ipAddress, const char
     char query[768];
     Format(query, sizeof(query), "DELETE FROM bans WHERE %s", condition);
     SQL_FastQuery(g_AccessSnapshotDb, query);
+
+    // 解封后给该 Steam 一个短期风险拦截豁免（下一次新鲜快照会更新 risk_ips）。
+    MarkRiskExempt(steamId, 300);
 
     if (eventId[0] != '\0')
     {
@@ -1785,6 +1847,14 @@ bool SaveAccessSnapshot(JSONObject item)
         LogError("[LumiAdmin-Access] access snapshot: COMMIT failed, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
         return false;
+    }
+
+    // 新鲜快照已包含最新 risk_ips，清掉解封豁免，恢复正常的 IP 风险判断。
+    // 仅当后端支持节点事件版本时清理；旧后端（latest_version=0）保留豁免到 TTL，
+    // 避免旧快照把刚解封的玩家再次拦回去。
+    if (LumiJsonGetInt(item, "latest_version") > 0)
+    {
+        SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM risk_exempt");
     }
 
     g_AccessSnapshotBackoffStep = 0;
