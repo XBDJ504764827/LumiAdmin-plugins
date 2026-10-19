@@ -151,6 +151,9 @@ bool PostJsonObject(const char[] url, JSONObject payload, HTTPRequestCallback ca
 
     HTTPRequest request = new HTTPRequest(url);
     request.Timeout = timeout > 0 ? RoundToZero(timeout) : 10;
+    // 节点同步请求频率很低（25~30s），禁用 keep-alive 避免代理/服务端关闭空闲连接后
+    // libcurl 重试 POST 时报 "necessary data rewind wasn't possible"。
+    request.SetHeader("Connection", "close");
     request.Post(payload, callback, value);
     // 注意：不要 delete request（RIPExt 自动释放；delete 会导致 Handle invalid）
     return true;

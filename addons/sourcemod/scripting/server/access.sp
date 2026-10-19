@@ -1490,7 +1490,12 @@ void AuthMarkEventApplied(const char[] eventId, int version)
     SQL_EscapeString(g_AccessSnapshotDb, eventId, escaped, sizeof(escaped));
     Format(query, sizeof(query), "INSERT OR IGNORE INTO applied_events (event_id, version) VALUES ('%s', %d)", escaped, version);
     SQL_FastQuery(g_AccessSnapshotDb, query);
-    AuthPersistAppliedVersion(version);
+    // 快车道（fastpath:...）只写本地封禁，不能推进全局事件游标：
+    // 否则会跳过「上次已应用版本」与快车道版本之间的其它 ban/whitelist 事件。
+    if (strncmp(eventId, "fastpath:", 9) != 0)
+    {
+        AuthPersistAppliedVersion(version);
+    }
 }
 
 void AuthPersistAppliedVersion(int version)
