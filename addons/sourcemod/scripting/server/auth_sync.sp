@@ -301,38 +301,6 @@ void AuthSync_KickIfOnline(const char[] steamId, const char[] ip, const char[] r
     }
 }
 
-void AuthSync_Ack(int version)
-{
-    char token[MAX_SERVER_TOKEN];
-    char url[512];
-    int currentPort = 0;
-    if (!GetCurrentServerPort(currentPort))
-    {
-        return;
-    }
-    if (!ResolvePluginApiConfig(url, sizeof(url), "/auth/ack", token, sizeof(token)))
-    {
-        return;
-    }
-
-    JSONObject payload = new JSONObject();
-    payload.SetString("report_token", token);
-    payload.SetInt("port", currentPort);
-    payload.SetInt("version", version);
-    PostJsonObject(url, payload, OnAuthAckResponse, version, 10.0);
-    delete payload;
-    LogMessage("[LumiAuth] ACK %d.", version);
-}
-
-public void OnAuthAckResponse(HTTPResponse response, any value, const char[] error)
-{
-    if (error[0] != '\0' || response.Status < HTTPStatus_OK || response.Status >= HTTPStatus_MultipleChoices)
-    {
-        LogMessage("[LumiAuth] ACK %d failed, will re-ack on next poll.", value);
-        return;
-    }
-}
-
 void AuthSync_RequestSnapshot()
 {
     char token[MAX_SERVER_TOKEN];
@@ -395,12 +363,12 @@ public void OnAuthSnapshotResponse(HTTPResponse response, any value, const char[
 
     AuthPersistAppliedVersion(latestVersion);
     AuthSync_OnReachable();
-    LogMessage("[LumiAuth] Snapshot applied: %d.", latestVersion);
+    LogMessage("[LumiAuth] Snapshot applied: %d.", g_AuthLastAppliedVersion);
     LogAccessEvent("snapshot", "applied");
 
     // Q5：恢复后立即全服比对补踢
     AuthReconcileOnlinePlayers();
-    AuthSync_Ack(latestVersion);
+    AuthSync_Ack(g_AuthLastAppliedVersion);
 }
 
 void AuthSync_OnReachable()

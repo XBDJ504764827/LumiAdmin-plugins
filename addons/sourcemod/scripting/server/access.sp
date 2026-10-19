@@ -990,6 +990,39 @@ bool AccessSync_TryAcquireLease(int ttlSeconds)
     }
     return acquired;
 }
+void AuthSync_Ack(int version)
+{
+    char token[MAX_SERVER_TOKEN];
+    char url[512];
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        return;
+    }
+    if (!ResolvePluginApiConfig(url, sizeof(url), "/auth/ack", token, sizeof(token)))
+    {
+        return;
+    }
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", currentPort);
+    payload.SetInt("version", version);
+    PostJsonObject(url, payload, OnAuthAckResponse, version, 10.0);
+    delete payload;
+    LogMessage("[LumiAuth] ACK %d.", version);
+}
+
+public void OnAuthAckResponse(HTTPResponse response, any value, const char[] error)
+{
+    if (error[0] != '\0' || response.Status < HTTPStatus_OK || response.Status >= HTTPStatus_MultipleChoices)
+    {
+        LogMessage("[LumiAuth] ACK %d failed, will re-ack on next poll.", value);
+        return;
+    }
+}
+
+
 void StartAccessSnapshotTimer()
 {
     StopAccessSnapshotTimer();
@@ -1181,9 +1214,19 @@ public void OnAccessSnapshotResponse(HTTPResponse response, any value, const cha
     }
 
     bool wasSynced = LocalSnapshotEverSynced();
-    SaveAccessSnapshot(item);
+    bool saved = SaveAccessSnapshot(item);
     delete item;
     delete root;
+    if (!saved)
+    {
+        SnapshotRefreshFailed("snapshot save failed", "");
+        return;
+    }
+    // 快照成功写入后同步 ACK 节点版本，避免「本地已应用但网站仍显示落后」。
+    if (g_AuthLastAppliedVersion > 0)
+    {
+        AuthSync_Ack(g_AuthLastAppliedVersion);
+    }
     // 首启/部署窗口内放行过的玩家：首次同步成功后立即比对补踢
     if (!wasSynced && LocalSnapshotEverSynced())
     {
@@ -1217,9 +1260,31 @@ void InitAccessSnapshotDb()
     }
 
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    // 旧版 server_rules 是单行表（id INTEGER PRIMARY KEY CHECK (id = 1)），
+    // 节点快照需要按端口存多行；直接丢弃旧表（只是缓存，下一次快照会重建），
+    // 否则第 2 台服的 INSERT 会触发 CHECK 失败导致整份快照回滚。
+    bool legacyRulesTable = false;
+    DBResultSet ruleInfo = SQL_Query(g_AccessSnapshotDb, "PRAGMA table_info(server_rules)");
+    if (ruleInfo != null)
+    {
+        while (SQL_FetchRow(ruleInfo))
+        {
+            char columnName[64];
+            SQL_FetchString(ruleInfo, 1, columnName, sizeof(columnName));
+            if (StrEqual(columnName, "id", false))
+            {
+                legacyRulesTable = true;
+            }
+        }
+        delete ruleInfo;
+    }
+    if (legacyRulesTable)
+    {
+        LogMessage("[LumiAdmin-Access] migrating legacy single-row server_rules to per-port schema.");
+        SQL_FastQuery(g_AccessSnapshotDb, "DROP TABLE server_rules");
+    }
     // LumiAuth 节点同步：server_rules 按端口存该节点下所有服的规则（同一台机器共享一份快照）。
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS server_rules (port INTEGER PRIMARY KEY, whitelist_mode_enabled INTEGER NOT NULL DEFAULT 0, access_restriction_enabled INTEGER NOT NULL DEFAULT 0, min_rating INTEGER NOT NULL DEFAULT 0, min_steam_level INTEGER NOT NULL DEFAULT 0, risk_block_enabled INTEGER NOT NULL DEFAULT 0)");
-    // 旧库升级：补 port / risk_block_enabled 列（CREATE IF NOT EXISTS 不会改已有表）
     SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE server_rules ADD COLUMN port INTEGER");
     SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE server_rules ADD COLUMN risk_block_enabled INTEGER NOT NULL DEFAULT 0");
     // 节点同步租约：同一台机器上只有一个进程（leader）轮询网站并写库，其余进程只读共享库。
@@ -1504,6 +1569,15 @@ void AuthReconcileOnlinePlayers()
  */
 bool SnapshotIsOlderThanLocal(JSONObject item)
 {
+    // 事件版本单调保护：快照构建时的节点版本若落后于本地已应用的事件版本，
+    // 说明它可能是解封/加白名单之前构建的旧快照，直接拒绝，避免把刚解除的封禁写回来。
+    int snapshotVersion = LumiJsonGetInt(item, "latest_version");
+    if (snapshotVersion > 0 && snapshotVersion < g_AuthLastAppliedVersion)
+    {
+        LogError("[LumiAdmin-Access] access snapshot: stale by event version (snapshot=%d applied=%d), ignored.", snapshotVersion, g_AuthLastAppliedVersion);
+        return true;
+    }
+
     char existing[32];
     if (!GetMetadataValue("generated_at_unix", existing, sizeof(existing)) || existing[0] == '\0')
     {
@@ -1552,23 +1626,23 @@ bool SaveSnapshotServerRules(JSONArray servers)
     return true;
 }
 
-void SaveAccessSnapshot(JSONObject item)
+bool SaveAccessSnapshot(JSONObject item)
 {
     if (g_AccessSnapshotDb == null)
     {
-        return;
+        return false;
     }
 
     if (SnapshotIsOlderThanLocal(item))
     {
         LogError("[LumiAdmin-Access] access snapshot: ignoring older snapshot (rollback guard).");
-        return;
+        return false;
     }
 
     if (!SQL_FastQuery(g_AccessSnapshotDb, "BEGIN IMMEDIATE TRANSACTION"))
     {
         LogError("[LumiAdmin-Access] access snapshot: failed to BEGIN transaction.");
-        return;
+        return false;
     }
 
     if (!SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM metadata")
@@ -1580,7 +1654,7 @@ void SaveAccessSnapshot(JSONObject item)
     {
         LogError("[LumiAdmin-Access] access snapshot: cleanup failed, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     char version[128];
@@ -1596,7 +1670,7 @@ void SaveAccessSnapshot(JSONObject item)
     {
         LogError("[LumiAdmin-Access] access snapshot: metadata insert failed, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     char generatedAtUnix[32];
@@ -1608,7 +1682,7 @@ void SaveAccessSnapshot(JSONObject item)
     {
         LogError("[LumiAdmin-Access] access snapshot: metadata unix insert failed, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     // 节点快照：servers 数组包含该机器上所有服的规则，本进程按当前端口取用。
@@ -1656,7 +1730,7 @@ void SaveAccessSnapshot(JSONObject item)
         // 直接回滚保留旧规则，等待下一次全量快照。
         LogError("[LumiAdmin-Access] access snapshot: missing server rules, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     JSONArray bans = view_as<JSONArray>(item.Get("bans"));
@@ -1668,7 +1742,7 @@ void SaveAccessSnapshot(JSONObject item)
     if (!bansSaved)
     {
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     JSONArray whitelist = view_as<JSONArray>(item.Get("whitelist"));
@@ -1680,7 +1754,7 @@ void SaveAccessSnapshot(JSONObject item)
     if (!whitelistSaved)
     {
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     JSONArray profiles = view_as<JSONArray>(item.Get("access_profiles"));
@@ -1692,7 +1766,7 @@ void SaveAccessSnapshot(JSONObject item)
     if (!profilesSaved)
     {
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     JSONArray riskIps = view_as<JSONArray>(item.Get("risk_ips"));
@@ -1704,20 +1778,26 @@ void SaveAccessSnapshot(JSONObject item)
     if (!riskIpsSaved)
     {
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     if (!SQL_FastQuery(g_AccessSnapshotDb, "COMMIT"))
     {
         LogError("[LumiAdmin-Access] access snapshot: COMMIT failed, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-        return;
+        return false;
     }
 
     g_AccessSnapshotBackoffStep = 0;
     g_AccessSnapshotLastRefreshOk = GetTime();
     strcopy(g_AccessSnapshotEtag, sizeof(g_AccessSnapshotEtag), version);
-    LogMessage("[LumiAdmin-Access] snapshot refreshed: version '%s', bans/whitelist/profiles/risk_ips updated.", version);
+    int snapshotVersion = LumiJsonGetInt(item, "latest_version");
+    if (snapshotVersion > 0)
+    {
+        AuthPersistAppliedVersion(snapshotVersion);
+    }
+    LogMessage("[LumiAdmin-Access] snapshot refreshed: version '%s' (event version %d), bans/whitelist/profiles/risk_ips updated.", version, snapshotVersion);
+    return true;
 }
 
 bool InsertMetadata(const char[] key, const char[] value)
