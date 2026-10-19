@@ -102,7 +102,7 @@ public Plugin myinfo =
     name = "LumiAdmin Server",
     author = "LumiAdmin",
     description = "Reports CS:GO online players and server status to LumiAdmin, enforces bans and access control.",
-    version = "1.0.0",
+    version = "1.1.0",
     url = ""
 };
 
