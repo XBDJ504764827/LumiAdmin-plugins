@@ -441,18 +441,12 @@ Action CommandApplyBanFastPath(int args)
         LogError("[LumiAuth] lumiadmin_apply_ban: local persist failed for %s.", steamId);
         return Plugin_Handled;
     }
-    if (version > 0)
-    {
-        AuthPersistAppliedVersion(version);
-    }
-    LogMessage("[LumiAuth] Fast-path ban persisted for %s (version %d).", steamId, version);
+    // 注意：这里不推进事件游标、也不 ACK。快车道只负责「先落本地 + 先踢」，
+    // 真正的 ban.add 事件仍由 poll 按顺序应用并 ACK，避免跳过中间事件。
+    LogMessage("[LumiAuth] Fast-path ban persisted for %s (event version %d).", steamId, version);
 
     // 2) 再 Kick 在服命中者（此时重连必被本地拦，竞态关闭）
     AuthSync_KickIfOnline(steamId, "", reason);
-    if (version > 0)
-    {
-        AuthSync_Ack(version);
-    }
     return Plugin_Handled;
 }
 
