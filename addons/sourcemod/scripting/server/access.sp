@@ -585,7 +585,14 @@ LocalRuleDecision OfflineEvaluateRules(
         return LocalRule_Unavailable;
     }
 
-    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled FROM server_rules WHERE id = 1");
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        return LocalRule_Unavailable;
+    }
+    char ruleQuery[192];
+    Format(ruleQuery, sizeof(ruleQuery), "SELECT whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled FROM server_rules WHERE port = %d", currentPort);
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, ruleQuery);
     if (results == null)
     {
         return LocalRule_Unavailable;
@@ -681,8 +688,17 @@ LocalRuleDecision OfflineEvaluateRules(
 
 bool SnapshotHasRule(const char[] column)
 {
-    char query[128];
-    Format(query, sizeof(query), "SELECT %s FROM server_rules WHERE id = 1", column);
+    if (g_AccessSnapshotDb == null)
+    {
+        return false;
+    }
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        return false;
+    }
+    char query[160];
+    Format(query, sizeof(query), "SELECT %s FROM server_rules WHERE port = %d", column, currentPort);
     DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
     if (results == null)
     {
@@ -882,6 +898,98 @@ void FormatProfileDeny(ProfileCheck check, int rating, int steamLevel, int minRa
 
 // =====[ 快照刷新 ]=====
 
+// =====[ 节点同步租约（leader 选举）]=====
+//
+// 同一台游戏机上的所有服共享同一个 SQLite 文件，但只有 leader 进程轮询网站、
+// 应用事件与快照；其余进程只读共享库做本地裁决。leader 掉线后租约过期，
+// 其它进程自动接管。
+
+char g_AccessSyncOwner[32];
+bool g_AccessSyncIsLeader = false;
+int g_AccessSyncLeaseUntil = 0;
+
+int AccessSyncLeaseTtl()
+{
+    int interval = g_AccessSnapshotInterval != null ? g_AccessSnapshotInterval.IntValue : 30;
+    int ttl = interval * 3;
+    if (ttl < 90)
+    {
+        ttl = 90;
+    }
+    return ttl;
+}
+
+void AccessSync_InitOwner()
+{
+    if (g_AccessSyncOwner[0] != '\0')
+    {
+        return;
+    }
+    int port = 0;
+    GetCurrentServerPort(port);
+    Format(g_AccessSyncOwner, sizeof(g_AccessSyncOwner), "port:%d", port);
+}
+
+/**
+ * 尝试获取/续约 leader 租约。返回 true 表示本进程是（或已成为）leader。
+ * 使用 BEGIN IMMEDIATE 串行化，避免多进程同时抢占。
+ */
+bool AccessSync_TryAcquireLease(int ttlSeconds)
+{
+    if (g_AccessSnapshotDb == null)
+    {
+        return false;
+    }
+    AccessSync_InitOwner();
+
+    int now = GetTime();
+    if (g_AccessSyncIsLeader && now < g_AccessSyncLeaseUntil)
+    {
+        char renew[256];
+        Format(renew, sizeof(renew), "UPDATE sync_lease SET expires_at = %d WHERE id = 1 AND owner = '%s'", now + ttlSeconds, g_AccessSyncOwner);
+        if (SQL_FastQuery(g_AccessSnapshotDb, renew))
+        {
+            g_AccessSyncLeaseUntil = now + ttlSeconds;
+            return true;
+        }
+        g_AccessSyncIsLeader = false;
+    }
+
+    if (!SQL_FastQuery(g_AccessSnapshotDb, "BEGIN IMMEDIATE"))
+    {
+        return g_AccessSyncIsLeader;
+    }
+
+    bool acquired = false;
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT owner, expires_at FROM sync_lease WHERE id = 1");
+    if (results != null)
+    {
+        bool canTake = true;
+        if (SQL_FetchRow(results))
+        {
+            char owner[32];
+            SQL_FetchString(results, 0, owner, sizeof(owner));
+            int expiresAt = SQL_FetchInt(results, 1);
+            canTake = (expiresAt <= now) || StrEqual(owner, g_AccessSyncOwner);
+        }
+        delete results;
+
+        if (canTake)
+        {
+            char take[256];
+            Format(take, sizeof(take), "INSERT OR REPLACE INTO sync_lease (id, owner, expires_at) VALUES (1, '%s', %d)", g_AccessSyncOwner, now + ttlSeconds);
+            acquired = SQL_FastQuery(g_AccessSnapshotDb, take);
+        }
+    }
+    SQL_FastQuery(g_AccessSnapshotDb, acquired ? "COMMIT" : "ROLLBACK");
+
+    g_AccessSyncIsLeader = acquired;
+    if (acquired)
+    {
+        g_AccessSyncLeaseUntil = now + ttlSeconds;
+    }
+    return acquired;
+}
 void StartAccessSnapshotTimer()
 {
     StopAccessSnapshotTimer();
@@ -937,6 +1045,11 @@ public Action Timer_RefreshAccessSnapshot(Handle timer)
 void RefreshAccessSnapshot()
 {
     if (g_AccessSnapshotDb == null)
+    {
+        return;
+    }
+    // 同一台机器只有 leader 拉快照，避免 N 台服重复下载与并发写库。
+    if (!AccessSync_TryAcquireLease(AccessSyncLeaseTtl()))
     {
         return;
     }
@@ -1007,7 +1120,14 @@ bool LocalServerRulesPresent()
         return false;
     }
 
-    DBResultSet results = SQL_Query(g_AccessSnapshotDb, "SELECT 1 FROM server_rules WHERE id = 1 LIMIT 1");
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        return false;
+    }
+    char ruleQuery[128];
+    Format(ruleQuery, sizeof(ruleQuery), "SELECT 1 FROM server_rules WHERE port = %d LIMIT 1", currentPort);
+    DBResultSet results = SQL_Query(g_AccessSnapshotDb, ruleQuery);
     if (results == null)
     {
         return false;
@@ -1097,9 +1217,13 @@ void InitAccessSnapshotDb()
     }
 
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS server_rules (id INTEGER PRIMARY KEY CHECK (id = 1), whitelist_mode_enabled INTEGER NOT NULL, access_restriction_enabled INTEGER NOT NULL, min_rating INTEGER NOT NULL, min_steam_level INTEGER NOT NULL, risk_block_enabled INTEGER NOT NULL DEFAULT 0)");
-    // 旧库升级：补 risk_block_enabled 列（CREATE IF NOT EXISTS 不会改已有表）
+    // LumiAuth 节点同步：server_rules 按端口存该节点下所有服的规则（同一台机器共享一份快照）。
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS server_rules (port INTEGER PRIMARY KEY, whitelist_mode_enabled INTEGER NOT NULL DEFAULT 0, access_restriction_enabled INTEGER NOT NULL DEFAULT 0, min_rating INTEGER NOT NULL DEFAULT 0, min_steam_level INTEGER NOT NULL DEFAULT 0, risk_block_enabled INTEGER NOT NULL DEFAULT 0)");
+    // 旧库升级：补 port / risk_block_enabled 列（CREATE IF NOT EXISTS 不会改已有表）
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE server_rules ADD COLUMN port INTEGER");
     SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE server_rules ADD COLUMN risk_block_enabled INTEGER NOT NULL DEFAULT 0");
+    // 节点同步租约：同一台机器上只有一个进程（leader）轮询网站并写库，其余进程只读共享库。
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS sync_lease (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS risk_ips (ip TEXT PRIMARY KEY)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS bans (steam_id TEXT, ip_address TEXT, reason TEXT NOT NULL, expires_at INTEGER)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS whitelist (steam_id TEXT PRIMARY KEY)");
@@ -1179,7 +1303,7 @@ bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char
     return true;
 }
 
-bool AuthRemoveLocalBan(const char[] steamId, const char[] eventId, int version)
+bool AuthRemoveLocalBan(const char[] steamId, const char[] ipAddress, const char[] eventId, int version)
 {
     if (g_AccessSnapshotDb == null)
     {
@@ -1191,10 +1315,36 @@ bool AuthRemoveLocalBan(const char[] steamId, const char[] eventId, int version)
         return true;
     }
 
-    char escaped[128];
-    char query[256];
-    SQL_EscapeString(g_AccessSnapshotDb, steamId, escaped, sizeof(escaped));
-    Format(query, sizeof(query), "DELETE FROM bans WHERE steam_id = '%s'", escaped);
+    char escapedSteam[128];
+    char escapedIp[128];
+    char condition[512];
+    condition[0] = '\0';
+
+    // 优先按 SteamID 精确删除；仅当该行没有 SteamID（纯 IP 封禁）时才按 IP 删除，
+    // 避免误删同 IP 下其他玩家的封禁记录。
+    if (steamId[0] != '\0' && ipAddress[0] != '\0')
+    {
+        SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
+        SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIp, sizeof(escapedIp));
+        Format(condition, sizeof(condition), "steam_id = '%s' OR (ip_address = '%s' AND (steam_id = '' OR steam_id IS NULL))", escapedSteam, escapedIp);
+    }
+    else if (steamId[0] != '\0')
+    {
+        SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
+        Format(condition, sizeof(condition), "steam_id = '%s'", escapedSteam);
+    }
+    else if (ipAddress[0] != '\0')
+    {
+        SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIp, sizeof(escapedIp));
+        Format(condition, sizeof(condition), "ip_address = '%s' AND (steam_id = '' OR steam_id IS NULL)", escapedIp);
+    }
+    else
+    {
+        return false;
+    }
+
+    char query[768];
+    Format(query, sizeof(query), "DELETE FROM bans WHERE %s", condition);
     SQL_FastQuery(g_AccessSnapshotDb, query);
 
     if (eventId[0] != '\0')
@@ -1348,10 +1498,70 @@ void AuthReconcileOnlinePlayers()
     }
 }
 
+/**
+ * 快照单调保护：只应用不早于本地已应用快照的版本，避免旧快照把
+ * 事件刚删除的封禁 / 刚加入的白名单回滚覆盖。
+ */
+bool SnapshotIsOlderThanLocal(JSONObject item)
+{
+    char existing[32];
+    if (!GetMetadataValue("generated_at_unix", existing, sizeof(existing)) || existing[0] == '\0')
+    {
+        return false;
+    }
+    int localGenerated = StringToInt(existing);
+    int incomingGenerated = LumiJsonGetInt(item, "generated_at_unix");
+    return localGenerated > 0 && incomingGenerated > 0 && incomingGenerated < localGenerated;
+}
+
+bool SaveSnapshotServerRules(JSONArray servers)
+{
+    if (servers == null || servers.Length == 0)
+    {
+        return false;
+    }
+    for (int i = 0; i < servers.Length; i++)
+    {
+        JSONObject server = view_as<JSONObject>(servers.Get(i));
+        if (server == null)
+        {
+            continue;
+        }
+        int port = LumiJsonGetInt(server, "port");
+        if (port <= 0)
+        {
+            delete server;
+            continue;
+        }
+        char query[512];
+        Format(query, sizeof(query),
+            "INSERT OR REPLACE INTO server_rules (port, whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled) VALUES (%d, %d, %d, %d, %d, %d)",
+            port,
+            LumiJsonGetBool(server, "whitelist_mode_enabled") ? 1 : 0,
+            LumiJsonGetBool(server, "access_restriction_enabled") ? 1 : 0,
+            LumiJsonGetInt(server, "min_rating"),
+            LumiJsonGetInt(server, "min_steam_level"),
+            LumiJsonGetBool(server, "risk_block_enabled") ? 1 : 0);
+        delete server;
+        if (!SQL_FastQuery(g_AccessSnapshotDb, query))
+        {
+            LogError("[LumiAdmin-Access] access snapshot: server_rules insert failed for port %d", port);
+            return false;
+        }
+    }
+    return true;
+}
+
 void SaveAccessSnapshot(JSONObject item)
 {
     if (g_AccessSnapshotDb == null)
     {
+        return;
+    }
+
+    if (SnapshotIsOlderThanLocal(item))
+    {
+        LogError("[LumiAdmin-Access] access snapshot: ignoring older snapshot (rollback guard).");
         return;
     }
 
@@ -1401,30 +1611,49 @@ void SaveAccessSnapshot(JSONObject item)
         return;
     }
 
-    JSONObject server = view_as<JSONObject>(LumiJsonGet(item, "server"));
-    if (server != null)
+    // 节点快照：servers 数组包含该机器上所有服的规则，本进程按当前端口取用。
+    JSONArray servers = view_as<JSONArray>(LumiJsonGet(item, "servers"));
+    bool rulesSaved = false;
+    if (servers != null)
     {
-        char query[512];
-        Format(query, sizeof(query),
-            "INSERT INTO server_rules (id, whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled) VALUES (1, %d, %d, %d, %d, %d)",
-            LumiJsonGetBool(server, "whitelist_mode_enabled") ? 1 : 0,
-            LumiJsonGetBool(server, "access_restriction_enabled") ? 1 : 0,
-            LumiJsonGetInt(server, "min_rating"),
-            LumiJsonGetInt(server, "min_steam_level"),
-            LumiJsonGetBool(server, "risk_block_enabled") ? 1 : 0);
-        if (!SQL_FastQuery(g_AccessSnapshotDb, query))
-        {
-            LogError("[LumiAdmin-Access] access snapshot: server_rules insert failed, ROLLBACK.");
-            SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
-            delete server;
-            return;
-        }
-        delete server;
+        rulesSaved = SaveSnapshotServerRules(servers);
+        delete servers;
     }
     else
     {
-        // 缺少 server 段：不能清空规则表后留下空状态（会导致本地裁决全部 fail_open），
-        // 直接回滚保留旧规则，等待下一次带 server 的全量快照。
+        // 兼容旧的单服快照格式
+        JSONObject server = view_as<JSONObject>(LumiJsonGet(item, "server"));
+        if (server != null)
+        {
+            int port = LumiJsonGetInt(item, "port");
+            if (port <= 0)
+            {
+                port = LumiJsonGetInt(item, "server_port");
+            }
+            if (port <= 0)
+            {
+                GetCurrentServerPort(port);
+            }
+            if (port > 0)
+            {
+                char query[512];
+                Format(query, sizeof(query),
+                    "INSERT OR REPLACE INTO server_rules (port, whitelist_mode_enabled, access_restriction_enabled, min_rating, min_steam_level, risk_block_enabled) VALUES (%d, %d, %d, %d, %d, %d)",
+                    port,
+                    LumiJsonGetBool(server, "whitelist_mode_enabled") ? 1 : 0,
+                    LumiJsonGetBool(server, "access_restriction_enabled") ? 1 : 0,
+                    LumiJsonGetInt(server, "min_rating"),
+                    LumiJsonGetInt(server, "min_steam_level"),
+                    LumiJsonGetBool(server, "risk_block_enabled") ? 1 : 0);
+                rulesSaved = SQL_FastQuery(g_AccessSnapshotDb, query);
+            }
+            delete server;
+        }
+    }
+    if (!rulesSaved)
+    {
+        // 缺少规则段：不能清空规则表后留下空状态（会导致本地裁决全部 fail_open），
+        // 直接回滚保留旧规则，等待下一次全量快照。
         LogError("[LumiAdmin-Access] access snapshot: missing server rules, ROLLBACK.");
         SQL_FastQuery(g_AccessSnapshotDb, "ROLLBACK");
         return;
