@@ -18,6 +18,10 @@ void Server_OnPluginStart()
         "限制侧软失败（缺资料/旧快照低分）宽限（秒）：先放行并点查直取，到期仍未验证或确认不达标即踢出（零容忍）。未达标玩家在服内最多存在该时长。0 表示立即踢出（旧行为）。", _, true, 0.0, true, 120.0);
     g_AccessWhitelistGrace = CreateConVar("server_access_whitelist_grace", DEFAULT_ACCESS_WHITELIST_GRACE,
         "白名单缺失宽限（秒）：本地快照无白名单时先放行并实时回源点查（/access/whitelist/live），命中即留服，到期仍未通过即踢出（零容忍）。0 表示立即踢出（旧行为）。", _, true, 0.0, true, 120.0);
+    g_AccessProfileTimeout = CreateConVar("server_access_profile_timeout", DEFAULT_ACCESS_PROFILE_TIMEOUT,
+        "首次进服资料点查 HTTP 超时（秒）。后端会并发重试 3 轮，插件侧超时应大于后端总预算。", _, true, 5.0, true, 60.0);
+    g_AccessVerifyTimeout = CreateConVar("server_access_verify_timeout", DEFAULT_ACCESS_VERIFY_TIMEOUT,
+        "玩家进入游戏后等待 Rating/Steam 等级验证的最长时间（秒），超时仍未验证则踢出。", _, true, 3.0, true, 15.0);
     g_AuthEventsInterval = CreateConVar("server_auth_events_interval", DEFAULT_AUTH_EVENTS_INTERVAL,
         "授权事件 Long-Poll 间隔（秒，插件侧看门狗周期；后端 hold≤20s）。", _, true, 5.0, true, 120.0);
 

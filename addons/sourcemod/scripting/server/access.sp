@@ -199,45 +199,45 @@ void LocalAccessFallback(int client)
 
     if (decision == LocalRule_Deny)
     {
-        // 软失败宽限（双轨）：限制侧缺资料/旧低分走资料点查，白名单缺失走白名单
-        // 实时回源。回源早到即提前裁决，宽限定时器做最终裁决（零容忍）。
-        // 组合拒绝（白名单缺失 + 资料软失败）时两条回源同时触发。
+        // 资料未验证/旧低分：允许玩家先进入游戏，点查在 OnClientAuthorized 时已开始，
+        // 由 OnClientPostAdminCheck 启动 5 秒倒计时；到期仍未拿到完整 Rating+Steam 等级再踢出。
         bool restrictionGrace = IsGraceableRestrictionDeny(denyFailureCode);
         bool whitelistGrace = IsGraceableWhitelistDeny(denyFailureCode);
-        if (restrictionGrace || whitelistGrace)
+        if (restrictionGrace)
         {
-            float missingGrace = (g_AccessMissingGrace == null) ? 7.0 : g_AccessMissingGrace.FloatValue;
-            float wlGrace = (g_AccessWhitelistGrace == null) ? 7.0 : g_AccessWhitelistGrace.FloatValue;
-            float grace = missingGrace;
-            if (whitelistGrace && (!restrictionGrace || wlGrace > grace))
-            {
-                grace = wlGrace;
-            }
-            // 组合拒绝：限制码下本地白名单若也缺失，同样触发白名单回源
             bool needWlLive = whitelistGrace;
-            if (!needWlLive && restrictionGrace && SnapshotHasRule("whitelist_mode_enabled") && !OfflineWhitelistContains(steamId))
+            if (!needWlLive && SnapshotHasRule("whitelist_mode_enabled") && !OfflineWhitelistContains(steamId))
             {
                 needWlLive = true;
-                if (wlGrace > grace)
-                {
-                    grace = wlGrace;
-                }
             }
-            if (grace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
+            if (client > 0 && client <= MaxClients && g_AccessProfilePending[client] == 0)
             {
-                g_AccessMissingDeferred[client] = 1;
-                LogAccessEvent("allow", "soft-deny, live recheck + grace");
+                g_AccessProfilePending[client] = 1;
+                g_AccessProfileAttempts[client] = 0;
+                LogAccessEvent("allow", "restriction pending, live profile query");
                 ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
-                if (restrictionGrace)
-                {
-                    RequestPlayerProfile(client, steamId);
-                }
+                RequestPlayerProfile(client, steamId);
                 if (needWlLive)
                 {
                     RequestWhitelistLiveCheck(client, steamId);
                 }
                 RequestAccessSnapshotRefresh(true);
-                CreateTimer(grace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+            }
+            return;
+        }
+
+        // 白名单缺失：保留原有宽限 + 实时回源（不涉及 Rating/Steam 等级点查）
+        if (whitelistGrace)
+        {
+            float wlGrace = (g_AccessWhitelistGrace == null) ? 7.0 : g_AccessWhitelistGrace.FloatValue;
+            if (wlGrace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
+            {
+                g_AccessMissingDeferred[client] = 1;
+                LogAccessEvent("allow", "whitelist soft-deny, live recheck + grace");
+                ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
+                RequestWhitelistLiveCheck(client, steamId);
+                RequestAccessSnapshotRefresh(true);
+                CreateTimer(wlGrace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
                 return;
             }
         }
@@ -326,6 +326,82 @@ void RecheckAccessAfterProfile(int client, const char[] tag, bool kickOnMissing)
 /**
  * 宽限定时器：最终裁决（零容忍）。未达标玩家在服内存在时长不超过宽限。
  */
+/**
+ * 资料验证终裁：玩家进入游戏后 5 秒内仍未拿到完整 Rating + Steam 等级则踢出。
+ * 已拿到且满足门槛 → 留服；确认不达标 → 按具体原因踢出。
+ */
+public Action Timer_AccessProfileVerify(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+    g_AccessProfileVerifyTimer[client] = null;
+    if (!g_AccessProfilePending[client])
+    {
+        return Plugin_Stop;
+    }
+    g_AccessProfilePending[client] = 0;
+
+    char steamId[64];
+    char ipAddress[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        return Plugin_Stop;
+    }
+    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+
+    char reason[256];
+    bool ipCollision = false;
+    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
+    {
+        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
+        return Plugin_Stop;
+    }
+
+    char allowMethod[32];
+    char denyMethod[32];
+    char denyFailureCode[48];
+    char denyReason[256];
+    LocalRuleDecision decision = OfflineEvaluateRules(steamId, ipAddress, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+    if (decision == LocalRule_Allow)
+    {
+        LogAccessEvent("allow", "profile verified before kick");
+        ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
+        return Plugin_Stop;
+    }
+    if (decision == LocalRule_Deny)
+    {
+        char message[256];
+        if (StrEqual(denyFailureCode, "profile_missing"))
+        {
+            strcopy(message, sizeof(message), "无法验证你的 Rating / Steam 等级，请稍后重试。");
+        }
+        else
+        {
+            strcopy(message, sizeof(message), denyReason);
+        }
+        LogAccessEvent("kick", "profile verify timeout");
+        ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, message);
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
+        KickClient(client, "%s", message);
+        return Plugin_Stop;
+    }
+
+    if (!ShouldFailOpenAccessCheck())
+    {
+        LogAccessEvent("kick", "profile verify: rules unavailable, fail_closed");
+        ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
+        KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
+        return Plugin_Stop;
+    }
+    LogAccessEvent("allow", "profile verify: rules unavailable, fail_open");
+    ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
+    return Plugin_Stop;
+}
+
 public Action Timer_AccessMissingRecheck(Handle timer, int userid)
 {
     int client = GetClientOfUserId(userid);
@@ -370,11 +446,38 @@ void RequestPlayerProfile(int client, const char[] steamId)
     payload.SetInt("port", currentPort);
     payload.SetString("steam_id64", steamId);
 
+    if (client > 0 && client <= MaxClients)
+    {
+        g_AccessProfileAttempts[client]++;
+    }
+
     DataPack pack = new DataPack();
     pack.WriteCell(GetClientUserId(client));
     pack.WriteString(steamId);
-    PostJsonObject(url, payload, OnAccessProfileResponse, pack, g_AccessCheckTimeout.FloatValue);
+    float profileTimeout = g_AccessProfileTimeout != null ? g_AccessProfileTimeout.FloatValue : 20.0;
+    PostJsonObject(url, payload, OnAccessProfileResponse, pack, profileTimeout);
     delete payload;
+}
+
+public Action Timer_RetryAccessProfile(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+    if (!g_AccessProfilePending[client] || g_AccessProfileAttempts[client] >= 3)
+    {
+        return Plugin_Stop;
+    }
+    char steamId[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        return Plugin_Stop;
+    }
+    LogAccessEvent("profile", "retry profile query");
+    RequestPlayerProfile(client, steamId);
+    return Plugin_Stop;
 }
 
 public void OnAccessProfileResponse(HTTPResponse response, any value, const char[] error)
@@ -392,8 +495,13 @@ public void OnAccessProfileResponse(HTTPResponse response, any value, const char
     }
     if (error[0] != '\0' || response.Status != HTTPStatus_OK)
     {
-        // 点查失败/超时：宽限定时器会按零容忍终裁，这里只记日志
         LogHttpPostFailure("access profile query", response, error);
+        int failedClient = GetClientOfUserId(userid);
+        if (failedClient > 0 && failedClient <= MaxClients && IsClientConnected(failedClient)
+            && g_AccessProfilePending[failedClient] && g_AccessProfileAttempts[failedClient] < 3)
+        {
+            CreateTimer(1.0, Timer_RetryAccessProfile, userid, TIMER_FLAG_NO_MAPCHANGE);
+        }
         return;
     }
 
@@ -425,12 +533,18 @@ public void OnAccessProfileResponse(HTTPResponse response, any value, const char
         return;
     }
     int client = GetClientOfUserId(userid);
-    if (client <= 0 || !IsClientConnected(client) || IsFakeClient(client))
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
     {
         return;
     }
-    // 点查早到：立即复核，不用等满宽限；仍是软失败则等定时器终裁
-    RecheckAccessAfterProfile(client, "grace recheck: point query hit", false);
+    // 已拿到完整资料：取消待验证标记，立即复核（达标留服 / 不达标踢出）。
+    g_AccessProfilePending[client] = 0;
+    if (g_AccessProfileVerifyTimer[client] != null)
+    {
+        KillTimer(g_AccessProfileVerifyTimer[client]);
+        g_AccessProfileVerifyTimer[client] = null;
+    }
+    RecheckAccessAfterProfile(client, "profile point query hit", false);
 }
 
 /**

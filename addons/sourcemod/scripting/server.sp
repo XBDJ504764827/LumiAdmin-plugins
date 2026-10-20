@@ -35,6 +35,8 @@ native int Sync_GetPendingCount();
 #define DEFAULT_ACCESS_MISSING_GRACE "7.0"
 #define DEFAULT_ACCESS_WHITELIST_GRACE "7.0"
 #define DEFAULT_AUTH_EVENTS_INTERVAL "25.0"
+#define DEFAULT_ACCESS_PROFILE_TIMEOUT "20.0"
+#define DEFAULT_ACCESS_VERIFY_TIMEOUT "5.0"
 #define AUTH_SNAPSHOT_VERSION_GAP 500
 #define ACCESS_SNAPSHOT_DB "lumiadmin_access_snapshot"
 #define MAX_SERVER_TOKEN 256
@@ -50,6 +52,8 @@ ConVar g_AccessFailOpen;
 ConVar g_AccessCheckTimeout;
 ConVar g_AccessMissingGrace;
 ConVar g_AccessWhitelistGrace;
+ConVar g_AccessProfileTimeout;
+ConVar g_AccessVerifyTimeout;
 ConVar g_CpuUsageCvar;
 ConVar g_HostPortCvar = null;
 ConVar g_TickrateCvar = null;
@@ -84,6 +88,11 @@ int g_AccessSnapshotLastRefreshOk = 0;
 // 旧版 bans 表升级标记：升级后立即触发一次全量快照，避免旧数据按错误类型参与裁决
 bool g_AccessBansSchemaUpgraded = false;
 
+// 首次进服资料点查：允许玩家先进入游戏，5 秒内仍未验证出 Rating/Steam 等级再踢出。
+int g_AccessProfilePending[MAXPLAYERS + 1];
+int g_AccessProfileAttempts[MAXPLAYERS + 1];
+Handle g_AccessProfileVerifyTimer[MAXPLAYERS + 1];
+
 // ban poll 失败退避状态（L10）
 int g_BanPollBackoffStep = 0;
 
@@ -104,7 +113,7 @@ public Plugin myinfo =
     name = "LumiAdmin Server",
     author = "LumiAdmin",
     description = "Reports CS:GO online players and server status to LumiAdmin, enforces bans and access control.",
-    version = "1.2.0",
+    version = "1.3.0",
     url = ""
 };
 
@@ -157,6 +166,29 @@ public void OnClientDisconnect(int client)
 public void OnClientPutInServer(int client)
 {
     ClearClientDisconnectReason(client);
+}
+
+/**
+ * 玩家完成连接（接近出现游戏画面）后，为待验证资料启动 5 秒倒计时。
+ * 资料点查在 OnClientAuthorized 时已开始，加载地图期间有充足时间完成。
+ */
+public void OnClientPostAdminCheck(int client)
+{
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return;
+    }
+    if (!g_AccessProfilePending[client])
+    {
+        return;
+    }
+    if (g_AccessProfileVerifyTimer[client] != null)
+    {
+        KillTimer(g_AccessProfileVerifyTimer[client]);
+        g_AccessProfileVerifyTimer[client] = null;
+    }
+    float verifyTimeout = g_AccessVerifyTimeout != null ? g_AccessVerifyTimeout.FloatValue : 5.0;
+    g_AccessProfileVerifyTimer[client] = CreateTimer(verifyTimeout, Timer_AccessProfileVerify, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
 }
 
 public void OnPluginEnd()
