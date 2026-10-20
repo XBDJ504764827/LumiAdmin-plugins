@@ -85,6 +85,29 @@ bool IsGraceableWhitelistDeny(const char[] failureCode)
 // =====[ 本地快照兜底 ]=====
 
 /**
+ * 命中本地封禁后的踢出处理：
+ * - Steam 封禁：按封禁理由踢；
+ * - IP 封禁：提示同 IP 连坐拦截（不新增封禁记录）。
+ */
+void KickForLocalBan(int client, const char[] steamId, const char[] ipAddress, const char[] reason, bool ipCollision)
+{
+    if (ipCollision)
+    {
+        char message[256];
+        strcopy(message, sizeof(message), "您当前使用的IP与其他正在封禁中玩家的IP一致，这会导致您无法进入服务器，如有疑问请联系管理员");
+        LogAccessEvent("kick", "ip collision with active ban");
+        ReportAccessDecision(client, steamId, ipAddress, false, "ip_collision", "shared_ip", message);
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
+        KickClient(client, "%s", message);
+        return;
+    }
+    LogAccessEvent("kick", "banned (local snapshot)");
+    ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
+    MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
+    KickClient(client, "%T", "Kick Banned Message", client, reason);
+}
+
+/**
  * 本地裁决：进服主链路（同步，零网络等待；资料未验证走宽限延迟复核）。
  * 快照「陈旧但可用」：过期只告警，不作为放行或踢人依据。
  */
@@ -138,12 +161,10 @@ void LocalAccessFallback(int client)
     }
 
     char reason[256];
-    if (hasAuth && FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
+    bool ipCollision = false;
+    if (hasAuth && FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
     {
-        LogAccessEvent("kick", "banned (local snapshot)");
-        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
-        MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
-        KickClient(client, "%T", "Kick Banned Message", client, reason);
+        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
         return;
     }
 
@@ -262,12 +283,10 @@ void RecheckAccessAfterProfile(int client, const char[] tag, bool kickOnMissing)
     GetClientIP(client, ipAddress, sizeof(ipAddress), true);
 
     char reason[256];
-    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
+    bool ipCollision = false;
+    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
     {
-        LogAccessEvent("kick", "grace recheck: banned");
-        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
-        MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
-        KickClient(client, "%T", "Kick Banned Message", client, reason);
+        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
         return;
     }
 
@@ -618,10 +637,8 @@ LocalRuleDecision OfflineEvaluateRules(
         meetsRestriction = profileCheck == ProfileCheck_Meets;
     }
 
-    // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效封禁账号关联 → 拒绝。
-    // 刚解封的 Steam 在短窗口内豁免，避免快照 risk_ips 尚未追平时又被拦回去。
-    bool riskExempt = IsRiskExempt(steamId);
-    if (riskBlockEnabled && !riskExempt && !(whitelistModeEnabled && hasWhitelist) && OfflineIpHasRisk(ipAddress))
+    // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效 IP 封禁账号关联 → 拒绝
+    if (riskBlockEnabled && !(whitelistModeEnabled && hasWhitelist) && OfflineIpHasRisk(ipAddress))
     {
         strcopy(denyMethod, denyMethodMaxLen, "risk_blocked");
         strcopy(denyFailureCode, failMaxLen, "risk_blocked");
@@ -735,14 +752,44 @@ bool GetMetadataValue(const char[] key, char[] value, int maxLen)
     return found;
 }
 
-bool FindOfflineBan(const char[] steamId, const char[] ipAddress, char[] reason, int maxLen)
+bool FindOfflineBan(const char[] steamId, const char[] ipAddress, char[] reason, int maxLen, bool &ipCollision)
 {
+    ipCollision = false;
+    if (g_AccessSnapshotDb == null || (steamId[0] == '\0' && ipAddress[0] == '\0'))
+    {
+        return false;
+    }
+
     char escapedSteamId[128];
     char escapedIpAddress[128];
-    char query[512];
     SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
     SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIpAddress, sizeof(escapedIpAddress));
-    Format(query, sizeof(query), "SELECT reason FROM bans WHERE (steam_id = '%s' OR ip_address = '%s') AND (expires_at IS NULL OR expires_at = 0 OR expires_at > %d) LIMIT 1", escapedSteamId, escapedIpAddress, GetTime());
+
+    // Steam 封禁只按 steam_id 匹配（不连坐 IP）；IP 封禁按 IP 匹配，
+    // account_unbanned=1 的账号从自身 IP 封禁中豁免。Steam 封禁优先返回。
+    char ipCondition[512];
+    if (ipAddress[0] != '\0')
+    {
+        Format(ipCondition, sizeof(ipCondition),
+            "((ip_address = '%s') OR (btrim(COALESCE(ip_address, '')) = '' AND steam_id = '%s'))",
+            escapedIpAddress, escapedSteamId);
+    }
+    else
+    {
+        Format(ipCondition, sizeof(ipCondition),
+            "(btrim(COALESCE(ip_address, '')) = '' AND steam_id = '%s')",
+            escapedSteamId);
+    }
+
+    char condition[1024];
+    Format(condition, sizeof(condition),
+        "(ban_type = 'steam' AND steam_id = '%s') OR (ban_type = 'ip' AND %s AND NOT (account_unbanned = 1 AND steam_id = '%s'))",
+        escapedSteamId, ipCondition, escapedSteamId);
+
+    char query[1024];
+    Format(query, sizeof(query),
+        "SELECT reason, ban_type FROM bans WHERE (%s) AND (expires_at IS NULL OR expires_at = 0 OR expires_at > %d) ORDER BY CASE WHEN ban_type = 'steam' THEN 0 ELSE 1 END LIMIT 1",
+        condition, GetTime());
 
     DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
     if (results == null)
@@ -754,6 +801,9 @@ bool FindOfflineBan(const char[] steamId, const char[] ipAddress, char[] reason,
     if (SQL_FetchRow(results))
     {
         SQL_FetchString(results, 0, reason, maxLen);
+        char banType[16];
+        SQL_FetchString(results, 1, banType, sizeof(banType));
+        ipCollision = StrEqual(banType, "ip");
         found = true;
     }
     delete results;
@@ -776,57 +826,6 @@ bool OfflineWhitelistContains(const char[] steamId)
     bool found = SQL_FetchRow(results);
     delete results;
     return found;
-}
-
-// 解封后的短期风险拦截豁免（避免快照未追平前再次被 risk_ips 拦截）
-bool IsRiskExempt(const char[] steamId)
-{
-    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
-    {
-        return false;
-    }
-    char escapedSteam[128];
-    char query[256];
-    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
-    Format(query, sizeof(query), "SELECT expires_at FROM risk_exempt WHERE steam_id = '%s' LIMIT 1", escapedSteam);
-    DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
-    if (results == null)
-    {
-        return false;
-    }
-    bool exempt = false;
-    if (SQL_FetchRow(results))
-    {
-        exempt = SQL_FetchInt(results, 0) > GetTime();
-    }
-    delete results;
-    return exempt;
-}
-
-void MarkRiskExempt(const char[] steamId, int seconds)
-{
-    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
-    {
-        return;
-    }
-    char escapedSteam[128];
-    char query[256];
-    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
-    Format(query, sizeof(query), "INSERT OR REPLACE INTO risk_exempt (steam_id, expires_at) VALUES ('%s', %d)", escapedSteam, GetTime() + seconds);
-    SQL_FastQuery(g_AccessSnapshotDb, query);
-}
-
-void ClearRiskExempt(const char[] steamId)
-{
-    if (g_AccessSnapshotDb == null || steamId[0] == '\0')
-    {
-        return;
-    }
-    char escapedSteam[128];
-    char query[256];
-    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
-    Format(query, sizeof(query), "DELETE FROM risk_exempt WHERE steam_id = '%s'", escapedSteam);
-    SQL_FastQuery(g_AccessSnapshotDb, query);
 }
 
 // 当前 IP 是否与「当前有效封禁账号」关联（快照 risk_ips 集合，供 risk_block 使用）
@@ -1337,11 +1336,31 @@ void InitAccessSnapshotDb()
     // 节点同步租约：同一台机器上只有一个进程（leader）轮询网站并写库，其余进程只读共享库。
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS sync_lease (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS risk_ips (ip TEXT PRIMARY KEY)");
-    // 解封后的短期豁免：解封事件只删 bans，但快照里的 risk_ips 仍可能包含该玩家 IP，
-    // 导致解封后仍被「中高风险 IP」拦截。这里给刚解封的 Steam 一个短期豁免，
-    // 等下一次新鲜快照确认该 IP 已不再关联有效封禁后自然恢复。
-    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS risk_exempt (steam_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)");
-    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS bans (steam_id TEXT, ip_address TEXT, reason TEXT NOT NULL, expires_at INTEGER)");
+    // 旧版 bans 表没有 ban_id/ban_type：这里补列并把旧行默认视为 IP 封禁（宁可多拦，等快照替换）。
+    bool legacyBansTable = false;
+    DBResultSet banInfo = SQL_Query(g_AccessSnapshotDb, "PRAGMA table_info(bans)");
+    if (banInfo != null)
+    {
+        bool hasBanId = false;
+        while (SQL_FetchRow(banInfo))
+        {
+            char columnName[64];
+            SQL_FetchString(banInfo, 1, columnName, sizeof(columnName));
+            if (StrEqual(columnName, "ban_id", false)) hasBanId = true;
+        }
+        delete banInfo;
+        legacyBansTable = !hasBanId;
+    }
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS bans (ban_id TEXT, steam_id TEXT, ip_address TEXT, reason TEXT NOT NULL, expires_at INTEGER, ban_type TEXT NOT NULL DEFAULT 'ip', account_unbanned INTEGER NOT NULL DEFAULT 0)");
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE bans ADD COLUMN ban_id TEXT");
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE bans ADD COLUMN ban_type TEXT NOT NULL DEFAULT 'ip'");
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE bans ADD COLUMN account_unbanned INTEGER NOT NULL DEFAULT 0");
+    SQL_FastQuery(g_AccessSnapshotDb, "DROP INDEX IF EXISTS idx_bans_dedupe");
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE UNIQUE INDEX IF NOT EXISTS idx_bans_ban_id ON bans(ban_id)");
+    if (legacyBansTable)
+    {
+        g_AccessBansSchemaUpgraded = true;
+    }
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS whitelist (steam_id TEXT PRIMARY KEY)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS access_profiles (steam_id TEXT PRIMARY KEY, rating INTEGER NOT NULL, steam_level INTEGER NOT NULL, expires_at INTEGER NOT NULL)");
 
@@ -1384,7 +1403,7 @@ void InitAccessSnapshotDb()
  * 快车道/事件写入本地封禁（先落盘再 Kick 由调用方保证顺序）。
  * eventId 为空时跳过幂等表（快车道 RCON 无 event_id，用 ban_id 去重由快照回放保证）。
  */
-bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char[] reason, int expiresAt, const char[] eventId, int version)
+bool AuthUpsertLocalBan(const char[] banId, const char[] banType, const char[] steamId, const char[] ipAddress, const char[] reason, int expiresAt, bool accountUnbanned, const char[] eventId, int version)
 {
     if (g_AccessSnapshotDb == null)
     {
@@ -1396,18 +1415,30 @@ bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char
         return true;
     }
 
+    char effectiveBanId[128];
+    if (banId[0] != '\0')
+    {
+        strcopy(effectiveBanId, sizeof(effectiveBanId), banId);
+    }
+    else
+    {
+        Format(effectiveBanId, sizeof(effectiveBanId), "legacy:%s:%s", steamId, ipAddress);
+    }
+
+    char escapedBanId[256];
     char escapedSteamId[128];
     char escapedIp[128];
     char escapedReason[512];
+    SQL_EscapeString(g_AccessSnapshotDb, effectiveBanId, escapedBanId, sizeof(escapedBanId));
     SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
     SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIp, sizeof(escapedIp));
     SQL_EscapeString(g_AccessSnapshotDb, reason, escapedReason, sizeof(escapedReason));
 
-    ClearRiskExempt(steamId);
-
-    char query[1024];
-    Format(query, sizeof(query), "INSERT OR IGNORE INTO bans (steam_id, ip_address, reason, expires_at) VALUES ('%s', '%s', '%s', %d)",
-        escapedSteamId, escapedIp, escapedReason, expiresAt);
+    char query[1536];
+    Format(query, sizeof(query),
+        "INSERT INTO bans (ban_id, ban_type, steam_id, ip_address, reason, expires_at, account_unbanned) VALUES ('%s', '%s', '%s', '%s', '%s', %d, %d) "
+        ... "ON CONFLICT(ban_id) DO UPDATE SET ban_type = excluded.ban_type, steam_id = excluded.steam_id, ip_address = excluded.ip_address, reason = excluded.reason, expires_at = excluded.expires_at, account_unbanned = excluded.account_unbanned",
+        escapedBanId, banType, escapedSteamId, escapedIp, escapedReason, expiresAt, accountUnbanned ? 1 : 0);
     if (!SQL_FastQuery(g_AccessSnapshotDb, query))
     {
         LogError("[LumiAuth] local ban upsert failed for %s.", steamId);
@@ -1421,7 +1452,25 @@ bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char
     return true;
 }
 
-bool AuthRemoveLocalBan(const char[] steamId, const char[] ipAddress, const char[] eventId, int version)
+bool AuthMarkAccountUnbanned(const char[] banId, const char[] steamId)
+{
+    if (g_AccessSnapshotDb == null || banId[0] == '\0')
+    {
+        return false;
+    }
+    char escapedBanId[256];
+    char escapedSteam[128];
+    char query[512];
+    SQL_EscapeString(g_AccessSnapshotDb, banId, escapedBanId, sizeof(escapedBanId));
+    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
+    Format(query, sizeof(query),
+        "UPDATE bans SET account_unbanned = 1 WHERE ban_id = '%s' AND steam_id = '%s'",
+        escapedBanId, escapedSteam);
+    SQL_FastQuery(g_AccessSnapshotDb, query);
+    return true;
+}
+
+bool AuthRemoveLocalBan(const char[] banId, const char[] steamId, const char[] ipAddress, const char[] eventId, int version)
 {
     if (g_AccessSnapshotDb == null)
     {
@@ -1433,18 +1482,16 @@ bool AuthRemoveLocalBan(const char[] steamId, const char[] ipAddress, const char
         return true;
     }
 
+    char escapedBanId[256];
     char escapedSteam[128];
     char escapedIp[128];
     char condition[512];
     condition[0] = '\0';
 
-    // 优先按 SteamID 精确删除；仅当该行没有 SteamID（纯 IP 封禁）时才按 IP 删除，
-    // 避免误删同 IP 下其他玩家的封禁记录。
-    if (steamId[0] != '\0' && ipAddress[0] != '\0')
+    if (banId[0] != '\0')
     {
-        SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
-        SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIp, sizeof(escapedIp));
-        Format(condition, sizeof(condition), "steam_id = '%s' OR (ip_address = '%s' AND (steam_id = '' OR steam_id IS NULL))", escapedSteam, escapedIp);
+        SQL_EscapeString(g_AccessSnapshotDb, banId, escapedBanId, sizeof(escapedBanId));
+        Format(condition, sizeof(condition), "ban_id = '%s'", escapedBanId);
     }
     else if (steamId[0] != '\0')
     {
@@ -1464,9 +1511,6 @@ bool AuthRemoveLocalBan(const char[] steamId, const char[] ipAddress, const char
     char query[768];
     Format(query, sizeof(query), "DELETE FROM bans WHERE %s", condition);
     SQL_FastQuery(g_AccessSnapshotDb, query);
-
-    // 解封后给该 Steam 一个短期风险拦截豁免（下一次新鲜快照会更新 risk_ips）。
-    MarkRiskExempt(steamId, 300);
 
     if (eventId[0] != '\0')
     {
@@ -1595,11 +1639,10 @@ void AuthReconcileOnlinePlayers()
         GetClientIP(client, ip, sizeof(ip), true);
 
         char reason[256];
-        if (FindOfflineBan(steamId, ip, reason, sizeof(reason)))
+        bool ipCollision = false;
+        if (FindOfflineBan(steamId, ip, reason, sizeof(reason), ipCollision))
         {
-            LogAccessEvent("kick", "reconcile: banned after resync");
-            MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
-            KickClient(client, "%T", "Kick Banned Message", client, reason);
+            KickForLocalBan(client, steamId, ip, reason, ipCollision);
             continue;
         }
 
@@ -1849,13 +1892,6 @@ bool SaveAccessSnapshot(JSONObject item)
         return false;
     }
 
-    // 新鲜快照已包含最新 risk_ips，清掉解封豁免，恢复正常的 IP 风险判断。
-    // 仅当后端支持节点事件版本时清理；旧后端（latest_version=0）保留豁免到 TTL，
-    // 避免旧快照把刚解封的玩家再次拦回去。
-    if (LumiJsonGetInt(item, "latest_version") > 0)
-    {
-        SQL_FastQuery(g_AccessSnapshotDb, "DELETE FROM risk_exempt");
-    }
 
     g_AccessSnapshotBackoffStep = 0;
     g_AccessSnapshotLastRefreshOk = GetTime();
@@ -1932,24 +1968,43 @@ bool SaveSnapshotBans(JSONArray bans)
             continue;
         }
 
+        char banId[64];
+        char banType[16];
         char steamId[64];
         char ipAddress[64];
         char reason[256];
         char expiresAtUnix[32];
+        banId[0] = '\0';
+        banType[0] = '\0';
+        ban.GetString("ban_id", banId, sizeof(banId));
+        ban.GetString("ban_type", banType, sizeof(banType));
         ban.GetString("steam_id", steamId, sizeof(steamId));
         ban.GetString("ip_address", ipAddress, sizeof(ipAddress));
         ban.GetString("reason", reason, sizeof(reason));
         IntToString(LumiJsonGetInt(ban, "expires_at_unix"), expiresAtUnix, sizeof(expiresAtUnix));
+        if (banType[0] == '\0')
+        {
+            strcopy(banType, sizeof(banType), ipAddress[0] != '\0' ? "ip" : "steam");
+        }
+        if (banId[0] == '\0')
+        {
+            Format(banId, sizeof(banId), "legacy:%s:%s", steamId, ipAddress);
+        }
+        bool accountUnbanned = LumiJsonGetBool(ban, "account_unbanned");
 
+        char escapedBanId[256];
         char escapedSteamId[128];
         char escapedIpAddress[128];
         char escapedReason[512];
+        SQL_EscapeString(g_AccessSnapshotDb, banId, escapedBanId, sizeof(escapedBanId));
         SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
         SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIpAddress, sizeof(escapedIpAddress));
         SQL_EscapeString(g_AccessSnapshotDb, reason, escapedReason, sizeof(escapedReason));
 
-        char query[1024];
-        Format(query, sizeof(query), "INSERT OR IGNORE INTO bans (steam_id, ip_address, reason, expires_at) VALUES ('%s', '%s', '%s', %d)", escapedSteamId, escapedIpAddress, escapedReason, StringToInt(expiresAtUnix));
+        char query[1536];
+        Format(query, sizeof(query),
+            "INSERT OR REPLACE INTO bans (ban_id, ban_type, steam_id, ip_address, reason, expires_at, account_unbanned) VALUES ('%s', '%s', '%s', '%s', '%s', %d, %d)",
+            escapedBanId, banType, escapedSteamId, escapedIpAddress, escapedReason, StringToInt(expiresAtUnix), accountUnbanned ? 1 : 0);
         if (!SQL_FastQuery(g_AccessSnapshotDb, query))
         {
             LogError("[LumiAdmin-Access] access snapshot: bans insert failed at index %d", i);

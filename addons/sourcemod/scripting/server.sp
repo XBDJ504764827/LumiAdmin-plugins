@@ -81,6 +81,8 @@ char g_AccessSnapshotEtag[MAX_ACCESS_SNAPSHOT_ETAG];
 int g_AccessSnapshotBackoffStep = 0;
 int g_AccessSnapshotNextRetry = 0;
 int g_AccessSnapshotLastRefreshOk = 0;
+// 旧版 bans 表升级标记：升级后立即触发一次全量快照，避免旧数据按错误类型参与裁决
+bool g_AccessBansSchemaUpgraded = false;
 
 // ban poll 失败退避状态（L10）
 int g_BanPollBackoffStep = 0;
@@ -102,7 +104,7 @@ public Plugin myinfo =
     name = "LumiAdmin Server",
     author = "LumiAdmin",
     description = "Reports CS:GO online players and server status to LumiAdmin, enforces bans and access control.",
-    version = "1.1.3",
+    version = "1.2.0",
     url = ""
 };
 

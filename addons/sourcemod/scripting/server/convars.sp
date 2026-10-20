@@ -47,7 +47,9 @@ void Server_OnPluginStart()
     RegServerCmd("lumiadmin_apply_ban", CommandApplyBanFastPath,
         "授权快车道：lumiadmin_apply_ban <ban_id> <version> <steam_id> <expires_unix|0> <reason>");
     RegServerCmd("lumiadmin_apply_unban", CommandApplyUnbanFastPath,
-        "授权快车道：lumiadmin_apply_unban <ban_id> <version> <steam_id>");
+        "授权快车道：lumiadmin_apply_unban <ban_id> <version> <steam_id> <ip>");
+    RegServerCmd("lumiadmin_apply_account_unban", CommandApplyAccountUnbanFastPath,
+        "授权快车道：lumiadmin_apply_account_unban <ban_id> <steam_id>（仅解封账号，IP 封禁保留）");
     RegServerCmd("lumiadmin_auth_resync", CommandAuthResync,
         "手动触发授权事件补偿（resync / snapshot）。");
     AddCommandListener(ChatHook, "say");
@@ -63,6 +65,10 @@ void Server_OnPluginStart()
     EnsureConfigDirectory();
     AutoExecConfig(true, "server", "sourcemod/lumiadmin");
     InitAccessSnapshotDb();
+    if (g_AccessBansSchemaUpgraded)
+    {
+        RequestAccessSnapshotRefresh(true);
+    }
     StartReportTimer();
     StartBanPollTimer();
     StartAccessSnapshotTimer();
