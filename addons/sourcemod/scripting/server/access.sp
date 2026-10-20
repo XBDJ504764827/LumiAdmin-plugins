@@ -39,9 +39,14 @@ public void OnClientAuthorized(int client, const char[] auth)
     if (client > 0 && client <= MaxClients)
     {
         g_AccessMissingDeferred[client] = 0;
+        g_AccessProfilePending[client] = 0;
+        g_AccessProfileAttempts[client] = 0;
+        g_AccessLivePending[client] = 0;
+        g_AccessLiveAttempts[client] = 0;
     }
-    // 本地同步裁决：零网络等待（资料未验证除外：先放行并延迟复核，见下）。
-    LocalAccessDecide(client);
+
+    // 网站实时裁决为主：允许玩家先加载地图，5 秒内出结果；网站不可达/超时才回退本地快照。
+    StartLiveAccessCheck(client);
 }
 
 /**
@@ -51,6 +56,261 @@ public void OnClientAuthorized(int client, const char[] auth)
 void LocalAccessDecide(int client)
 {
     LocalAccessFallback(client);
+}
+
+/**
+ * 网站实时裁决：POST /api/plugin/access/check。
+ * 插件不阻塞进服；结果到达前玩家可以继续加载地图。
+ */
+void StartLiveAccessCheck(int client)
+{
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return;
+    }
+
+    char steamId[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        LocalAccessDecide(client);
+        return;
+    }
+
+    char url[512];
+    char token[256];
+    if (!ResolvePluginApiConfig(url, sizeof(url), "/access/check", token, sizeof(token)))
+    {
+        LocalAccessDecide(client);
+        return;
+    }
+
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        LocalAccessDecide(client);
+        return;
+    }
+
+    char ipAddress[64];
+    char playerName[128];
+    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+    GetClientName(client, playerName, sizeof(playerName));
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", currentPort);
+    payload.SetInt("server_port", currentPort);
+    payload.SetString("steam_id64", steamId);
+    payload.SetString("ip_address", ipAddress);
+    payload.SetString("player", playerName);
+
+    g_AccessLivePending[client] = 1;
+    g_AccessLiveAttempts[client]++;
+
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamId);
+
+    float profileTimeout = g_AccessProfileTimeout != null ? g_AccessProfileTimeout.FloatValue : 20.0;
+    if (!PostJsonObject(url, payload, OnLiveAccessResponse, pack, profileTimeout))
+    {
+        g_AccessLivePending[client] = 0;
+        delete pack;
+        LocalAccessDecide(client);
+    }
+    delete payload;
+}
+
+void ClearAccessVerifyTimer(int client)
+{
+    if (client > 0 && client <= MaxClients && g_AccessProfileVerifyTimer[client] != null)
+    {
+        KillTimer(g_AccessProfileVerifyTimer[client]);
+        g_AccessProfileVerifyTimer[client] = null;
+    }
+}
+
+public void OnLiveAccessResponse(HTTPResponse response, any value, const char[] error)
+{
+    DataPack pack = view_as<DataPack>(value);
+    int userid = 0;
+    char steamId[64];
+    steamId[0] = '\0';
+    if (pack != null)
+    {
+        pack.Reset();
+        userid = pack.ReadCell();
+        pack.ReadString(steamId, sizeof(steamId));
+        delete pack;
+    }
+
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return;
+    }
+
+    if (error[0] != '\0' || response.Status != HTTPStatus_OK)
+    {
+        LogHttpPostFailure("live access check", response, error);
+        if (g_AccessLivePending[client] && g_AccessLiveAttempts[client] < 3)
+        {
+            CreateTimer(1.0, Timer_RetryLiveAccess, userid, TIMER_FLAG_NO_MAPCHANGE);
+        }
+        return;
+    }
+
+    JSONObject root = view_as<JSONObject>(response.Data);
+    if (root == null)
+    {
+        return;
+    }
+    JSONObject result = view_as<JSONObject>(root.Get("result"));
+    if (result == null)
+    {
+        delete root;
+        return;
+    }
+
+    bool allowed = LumiJsonGetBool(result, "allowed");
+    char message[512];
+    char failureCode[48];
+    message[0] = '\0';
+    failureCode[0] = '\0';
+    result.GetString("message", message, sizeof(message));
+    result.GetString("failure_code", failureCode, sizeof(failureCode));
+
+    bool hasRating = result.HasKey("rating") && !result.IsNull("rating");
+    bool hasSteamLevel = result.HasKey("steam_level") && !result.IsNull("steam_level");
+    int rating = hasRating ? LumiJsonGetInt(result, "rating") : 0;
+    int steamLevel = hasSteamLevel ? LumiJsonGetInt(result, "steam_level") : 0;
+    delete result;
+    delete root;
+
+    g_AccessLivePending[client] = 0;
+    ClearAccessVerifyTimer(client);
+
+    if (allowed)
+    {
+        LogAccessEvent("allow", "live access check");
+        if (hasRating && hasSteamLevel)
+        {
+            // 写入本地资料，供网站断联时兜底
+            UpsertAccessProfile(steamId, rating, steamLevel, GetTime() + 86400);
+        }
+        return;
+    }
+
+    // 网站重试后仍拿不到资料：回退本地已缓存资料/快照做最终裁决。
+    if (StrEqual(failureCode, "profile_fetch_failed") || StrEqual(failureCode, "profile_missing"))
+    {
+        LogAccessEvent("fallback", "live profile unavailable, use local snapshot");
+        FinalizeAccessFromSnapshot(client, true, true);
+        return;
+    }
+
+    if (message[0] == '\0')
+    {
+        strcopy(message, sizeof(message), "你无法进入该服务器。");
+    }
+    LogAccessEvent("kick", "live access denied");
+    MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
+    KickClient(client, "%s", message);
+}
+
+public Action Timer_RetryLiveAccess(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+    if (!g_AccessLivePending[client] || g_AccessLiveAttempts[client] >= 3)
+    {
+        return Plugin_Stop;
+    }
+    LogAccessEvent("access", "retry live access check");
+    StartLiveAccessCheck(client);
+    return Plugin_Stop;
+}
+
+/**
+ * 本地快照最终裁决（网站不可达或实时裁决明确返回资料不可用）。
+ * 不再发起任何实时点查，避免重复等待；未验证资料直接按 profile_missing 处理。
+ */
+void FinalizeAccessFromSnapshot(int client, bool kickOnMissing, bool report)
+{
+    char steamId[64];
+    char ipAddress[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        return;
+    }
+    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+
+    char reason[256];
+    bool ipCollision = false;
+    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
+    {
+        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
+        return;
+    }
+
+    char allowMethod[32];
+    char denyMethod[32];
+    char denyFailureCode[48];
+    char denyReason[256];
+    LocalRuleDecision decision = OfflineEvaluateRules(steamId, ipAddress, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+    if (decision == LocalRule_Allow)
+    {
+        LogAccessEvent("allow", "snapshot final");
+        if (report)
+        {
+            ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
+        }
+        return;
+    }
+    if (decision == LocalRule_Deny)
+    {
+        if (!kickOnMissing && IsGraceableRestrictionDeny(denyFailureCode))
+        {
+            return;
+        }
+        char message[256];
+        if (StrEqual(denyFailureCode, "profile_missing"))
+        {
+            strcopy(message, sizeof(message), "无法验证你的 Rating / Steam 等级，请稍后重试。");
+        }
+        else
+        {
+            strcopy(message, sizeof(message), denyReason);
+        }
+        LogAccessEvent("kick", "snapshot final deny");
+        if (report)
+        {
+            ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, message);
+        }
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
+        KickClient(client, "%s", message);
+        return;
+    }
+
+    if (!ShouldFailOpenAccessCheck())
+    {
+        LogAccessEvent("kick", "snapshot final: rules unavailable, fail_closed");
+        if (report)
+        {
+            ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
+        }
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
+        KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
+        return;
+    }
+    LogAccessEvent("allow", "snapshot final: rules unavailable, fail_open");
+    if (report)
+    {
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
+    }
 }
 
 /**
@@ -83,6 +343,29 @@ bool IsGraceableWhitelistDeny(const char[] failureCode)
 // 进服只走 LocalAccessDecide；后台对账走 auth_sync 事件 + 补偿快照。
 
 // =====[ 本地快照兜底 ]=====
+
+/**
+ * 命中本地封禁后的踢出处理：
+ * - Steam 封禁：按封禁理由踢；
+ * - IP 封禁：提示同 IP 连坐拦截（不新增封禁记录）。
+ */
+void KickForLocalBan(int client, const char[] steamId, const char[] ipAddress, const char[] reason, bool ipCollision)
+{
+    if (ipCollision)
+    {
+        char message[256];
+        strcopy(message, sizeof(message), "您当前使用的IP与其他正在封禁中玩家的IP一致，这会导致您无法进入服务器，如有疑问请联系管理员");
+        LogAccessEvent("kick", "ip collision with active ban");
+        ReportAccessDecision(client, steamId, ipAddress, false, "ip_collision", "shared_ip", message);
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
+        KickClient(client, "%s", message);
+        return;
+    }
+    LogAccessEvent("kick", "banned (local snapshot)");
+    ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
+    MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
+    KickClient(client, "%T", "Kick Banned Message", client, reason);
+}
 
 /**
  * 本地裁决：进服主链路（同步，零网络等待；资料未验证走宽限延迟复核）。
@@ -138,12 +421,10 @@ void LocalAccessFallback(int client)
     }
 
     char reason[256];
-    if (hasAuth && FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
+    bool ipCollision = false;
+    if (hasAuth && FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
     {
-        LogAccessEvent("kick", "banned (local snapshot)");
-        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
-        MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
-        KickClient(client, "%T", "Kick Banned Message", client, reason);
+        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
         return;
     }
 
@@ -178,45 +459,45 @@ void LocalAccessFallback(int client)
 
     if (decision == LocalRule_Deny)
     {
-        // 软失败宽限（双轨）：限制侧缺资料/旧低分走资料点查，白名单缺失走白名单
-        // 实时回源。回源早到即提前裁决，宽限定时器做最终裁决（零容忍）。
-        // 组合拒绝（白名单缺失 + 资料软失败）时两条回源同时触发。
+        // 资料未验证/旧低分：允许玩家先进入游戏，点查在 OnClientAuthorized 时已开始，
+        // 由 OnClientPostAdminCheck 启动 5 秒倒计时；到期仍未拿到完整 Rating+Steam 等级再踢出。
         bool restrictionGrace = IsGraceableRestrictionDeny(denyFailureCode);
         bool whitelistGrace = IsGraceableWhitelistDeny(denyFailureCode);
-        if (restrictionGrace || whitelistGrace)
+        if (restrictionGrace)
         {
-            float missingGrace = (g_AccessMissingGrace == null) ? 7.0 : g_AccessMissingGrace.FloatValue;
-            float wlGrace = (g_AccessWhitelistGrace == null) ? 7.0 : g_AccessWhitelistGrace.FloatValue;
-            float grace = missingGrace;
-            if (whitelistGrace && (!restrictionGrace || wlGrace > grace))
-            {
-                grace = wlGrace;
-            }
-            // 组合拒绝：限制码下本地白名单若也缺失，同样触发白名单回源
             bool needWlLive = whitelistGrace;
-            if (!needWlLive && restrictionGrace && SnapshotHasRule("whitelist_mode_enabled") && !OfflineWhitelistContains(steamId))
+            if (!needWlLive && SnapshotHasRule("whitelist_mode_enabled") && !OfflineWhitelistContains(steamId))
             {
                 needWlLive = true;
-                if (wlGrace > grace)
-                {
-                    grace = wlGrace;
-                }
             }
-            if (grace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
+            if (client > 0 && client <= MaxClients && g_AccessProfilePending[client] == 0)
             {
-                g_AccessMissingDeferred[client] = 1;
-                LogAccessEvent("allow", "soft-deny, live recheck + grace");
+                g_AccessProfilePending[client] = 1;
+                g_AccessProfileAttempts[client] = 0;
+                LogAccessEvent("allow", "restriction pending, live profile query");
                 ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
-                if (restrictionGrace)
-                {
-                    RequestPlayerProfile(client, steamId);
-                }
+                RequestPlayerProfile(client, steamId);
                 if (needWlLive)
                 {
                     RequestWhitelistLiveCheck(client, steamId);
                 }
                 RequestAccessSnapshotRefresh(true);
-                CreateTimer(grace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+            }
+            return;
+        }
+
+        // 白名单缺失：保留原有宽限 + 实时回源（不涉及 Rating/Steam 等级点查）
+        if (whitelistGrace)
+        {
+            float wlGrace = (g_AccessWhitelistGrace == null) ? 7.0 : g_AccessWhitelistGrace.FloatValue;
+            if (wlGrace > 0.0 && client > 0 && client <= MaxClients && g_AccessMissingDeferred[client] == 0)
+            {
+                g_AccessMissingDeferred[client] = 1;
+                LogAccessEvent("allow", "whitelist soft-deny, live recheck + grace");
+                ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, denyReason);
+                RequestWhitelistLiveCheck(client, steamId);
+                RequestAccessSnapshotRefresh(true);
+                CreateTimer(wlGrace, Timer_AccessMissingRecheck, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
                 return;
             }
         }
@@ -268,12 +549,10 @@ void RecheckAccessAfterProfile(int client, const char[] tag, bool kickOnMissing)
     GetClientIP(client, ipAddress, sizeof(ipAddress), true);
 
     char reason[256];
-    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason)))
+    bool ipCollision = false;
+    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
     {
-        LogAccessEvent("kick", "grace recheck: banned");
-        ReportAccessDecision(client, steamId, ipAddress, false, "banned", "banned", reason);
-        MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
-        KickClient(client, "%T", "Kick Banned Message", client, reason);
+        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
         return;
     }
 
@@ -313,6 +592,37 @@ void RecheckAccessAfterProfile(int client, const char[] tag, bool kickOnMissing)
 /**
  * 宽限定时器：最终裁决（零容忍）。未达标玩家在服内存在时长不超过宽限。
  */
+/**
+ * 资料验证终裁：玩家进入游戏后 5 秒内仍未拿到完整 Rating + Steam 等级则踢出。
+ * 已拿到且满足门槛 → 留服；确认不达标 → 按具体原因踢出。
+ */
+public Action Timer_AccessProfileVerify(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+    g_AccessProfileVerifyTimer[client] = null;
+
+    if (g_AccessLivePending[client])
+    {
+        g_AccessLivePending[client] = 0;
+        LogAccessEvent("fallback", "live access check timeout, use local snapshot");
+        FinalizeAccessFromSnapshot(client, true, true);
+        return Plugin_Stop;
+    }
+
+    if (g_AccessProfilePending[client])
+    {
+        g_AccessProfilePending[client] = 0;
+        FinalizeAccessFromSnapshot(client, true, true);
+        return Plugin_Stop;
+    }
+
+    return Plugin_Stop;
+}
+
 public Action Timer_AccessMissingRecheck(Handle timer, int userid)
 {
     int client = GetClientOfUserId(userid);
@@ -357,11 +667,38 @@ void RequestPlayerProfile(int client, const char[] steamId)
     payload.SetInt("port", currentPort);
     payload.SetString("steam_id64", steamId);
 
+    if (client > 0 && client <= MaxClients)
+    {
+        g_AccessProfileAttempts[client]++;
+    }
+
     DataPack pack = new DataPack();
     pack.WriteCell(GetClientUserId(client));
     pack.WriteString(steamId);
-    PostJsonObject(url, payload, OnAccessProfileResponse, pack, g_AccessCheckTimeout.FloatValue);
+    float profileTimeout = g_AccessProfileTimeout != null ? g_AccessProfileTimeout.FloatValue : 20.0;
+    PostJsonObject(url, payload, OnAccessProfileResponse, pack, profileTimeout);
     delete payload;
+}
+
+public Action Timer_RetryAccessProfile(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+    if (!g_AccessProfilePending[client] || g_AccessProfileAttempts[client] >= 3)
+    {
+        return Plugin_Stop;
+    }
+    char steamId[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        return Plugin_Stop;
+    }
+    LogAccessEvent("profile", "retry profile query");
+    RequestPlayerProfile(client, steamId);
+    return Plugin_Stop;
 }
 
 public void OnAccessProfileResponse(HTTPResponse response, any value, const char[] error)
@@ -379,8 +716,13 @@ public void OnAccessProfileResponse(HTTPResponse response, any value, const char
     }
     if (error[0] != '\0' || response.Status != HTTPStatus_OK)
     {
-        // 点查失败/超时：宽限定时器会按零容忍终裁，这里只记日志
         LogHttpPostFailure("access profile query", response, error);
+        int failedClient = GetClientOfUserId(userid);
+        if (failedClient > 0 && failedClient <= MaxClients && IsClientConnected(failedClient)
+            && g_AccessProfilePending[failedClient] && g_AccessProfileAttempts[failedClient] < 3)
+        {
+            CreateTimer(1.0, Timer_RetryAccessProfile, userid, TIMER_FLAG_NO_MAPCHANGE);
+        }
         return;
     }
 
@@ -412,12 +754,18 @@ public void OnAccessProfileResponse(HTTPResponse response, any value, const char
         return;
     }
     int client = GetClientOfUserId(userid);
-    if (client <= 0 || !IsClientConnected(client) || IsFakeClient(client))
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
     {
         return;
     }
-    // 点查早到：立即复核，不用等满宽限；仍是软失败则等定时器终裁
-    RecheckAccessAfterProfile(client, "grace recheck: point query hit", false);
+    // 已拿到完整资料：取消待验证标记，立即复核（达标留服 / 不达标踢出）。
+    g_AccessProfilePending[client] = 0;
+    if (g_AccessProfileVerifyTimer[client] != null)
+    {
+        KillTimer(g_AccessProfileVerifyTimer[client]);
+        g_AccessProfileVerifyTimer[client] = null;
+    }
+    RecheckAccessAfterProfile(client, "profile point query hit", false);
 }
 
 /**
@@ -624,7 +972,7 @@ LocalRuleDecision OfflineEvaluateRules(
         meetsRestriction = profileCheck == ProfileCheck_Meets;
     }
 
-    // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效封禁账号关联 → 拒绝
+    // 中高风险拦截（risk_block）：未持白名单且当前 IP 与有效 IP 封禁账号关联 → 拒绝
     if (riskBlockEnabled && !(whitelistModeEnabled && hasWhitelist) && OfflineIpHasRisk(ipAddress))
     {
         strcopy(denyMethod, denyMethodMaxLen, "risk_blocked");
@@ -739,14 +1087,44 @@ bool GetMetadataValue(const char[] key, char[] value, int maxLen)
     return found;
 }
 
-bool FindOfflineBan(const char[] steamId, const char[] ipAddress, char[] reason, int maxLen)
+bool FindOfflineBan(const char[] steamId, const char[] ipAddress, char[] reason, int maxLen, bool &ipCollision)
 {
+    ipCollision = false;
+    if (g_AccessSnapshotDb == null || (steamId[0] == '\0' && ipAddress[0] == '\0'))
+    {
+        return false;
+    }
+
     char escapedSteamId[128];
     char escapedIpAddress[128];
-    char query[512];
     SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
     SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIpAddress, sizeof(escapedIpAddress));
-    Format(query, sizeof(query), "SELECT reason FROM bans WHERE (steam_id = '%s' OR ip_address = '%s') AND (expires_at IS NULL OR expires_at = 0 OR expires_at > %d) LIMIT 1", escapedSteamId, escapedIpAddress, GetTime());
+
+    // Steam 封禁只按 steam_id 匹配（不连坐 IP）；IP 封禁按 IP 匹配，
+    // account_unbanned=1 的账号从自身 IP 封禁中豁免。Steam 封禁优先返回。
+    char ipCondition[512];
+    if (ipAddress[0] != '\0')
+    {
+        Format(ipCondition, sizeof(ipCondition),
+            "((ip_address = '%s') OR (btrim(COALESCE(ip_address, '')) = '' AND steam_id = '%s'))",
+            escapedIpAddress, escapedSteamId);
+    }
+    else
+    {
+        Format(ipCondition, sizeof(ipCondition),
+            "(btrim(COALESCE(ip_address, '')) = '' AND steam_id = '%s')",
+            escapedSteamId);
+    }
+
+    char condition[1024];
+    Format(condition, sizeof(condition),
+        "(ban_type = 'steam' AND steam_id = '%s') OR (ban_type = 'ip' AND %s AND NOT (account_unbanned = 1 AND steam_id = '%s'))",
+        escapedSteamId, ipCondition, escapedSteamId);
+
+    char query[1024];
+    Format(query, sizeof(query),
+        "SELECT reason, ban_type FROM bans WHERE (%s) AND (expires_at IS NULL OR expires_at = 0 OR expires_at > %d) ORDER BY CASE WHEN ban_type = 'steam' THEN 0 ELSE 1 END LIMIT 1",
+        condition, GetTime());
 
     DBResultSet results = SQL_Query(g_AccessSnapshotDb, query);
     if (results == null)
@@ -758,6 +1136,9 @@ bool FindOfflineBan(const char[] steamId, const char[] ipAddress, char[] reason,
     if (SQL_FetchRow(results))
     {
         SQL_FetchString(results, 0, reason, maxLen);
+        char banType[16];
+        SQL_FetchString(results, 1, banType, sizeof(banType));
+        ipCollision = StrEqual(banType, "ip");
         found = true;
     }
     delete results;
@@ -1290,7 +1671,31 @@ void InitAccessSnapshotDb()
     // 节点同步租约：同一台机器上只有一个进程（leader）轮询网站并写库，其余进程只读共享库。
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS sync_lease (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS risk_ips (ip TEXT PRIMARY KEY)");
-    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS bans (steam_id TEXT, ip_address TEXT, reason TEXT NOT NULL, expires_at INTEGER)");
+    // 旧版 bans 表没有 ban_id/ban_type：这里补列并把旧行默认视为 IP 封禁（宁可多拦，等快照替换）。
+    bool legacyBansTable = false;
+    DBResultSet banInfo = SQL_Query(g_AccessSnapshotDb, "PRAGMA table_info(bans)");
+    if (banInfo != null)
+    {
+        bool hasBanId = false;
+        while (SQL_FetchRow(banInfo))
+        {
+            char columnName[64];
+            SQL_FetchString(banInfo, 1, columnName, sizeof(columnName));
+            if (StrEqual(columnName, "ban_id", false)) hasBanId = true;
+        }
+        delete banInfo;
+        legacyBansTable = !hasBanId;
+    }
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS bans (ban_id TEXT, steam_id TEXT, ip_address TEXT, reason TEXT NOT NULL, expires_at INTEGER, ban_type TEXT NOT NULL DEFAULT 'ip', account_unbanned INTEGER NOT NULL DEFAULT 0)");
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE bans ADD COLUMN ban_id TEXT");
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE bans ADD COLUMN ban_type TEXT NOT NULL DEFAULT 'ip'");
+    SQL_FastQuery(g_AccessSnapshotDb, "ALTER TABLE bans ADD COLUMN account_unbanned INTEGER NOT NULL DEFAULT 0");
+    SQL_FastQuery(g_AccessSnapshotDb, "DROP INDEX IF EXISTS idx_bans_dedupe");
+    SQL_FastQuery(g_AccessSnapshotDb, "CREATE UNIQUE INDEX IF NOT EXISTS idx_bans_ban_id ON bans(ban_id)");
+    if (legacyBansTable)
+    {
+        g_AccessBansSchemaUpgraded = true;
+    }
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS whitelist (steam_id TEXT PRIMARY KEY)");
     SQL_FastQuery(g_AccessSnapshotDb, "CREATE TABLE IF NOT EXISTS access_profiles (steam_id TEXT PRIMARY KEY, rating INTEGER NOT NULL, steam_level INTEGER NOT NULL, expires_at INTEGER NOT NULL)");
 
@@ -1333,7 +1738,7 @@ void InitAccessSnapshotDb()
  * 快车道/事件写入本地封禁（先落盘再 Kick 由调用方保证顺序）。
  * eventId 为空时跳过幂等表（快车道 RCON 无 event_id，用 ban_id 去重由快照回放保证）。
  */
-bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char[] reason, int expiresAt, const char[] eventId, int version)
+bool AuthUpsertLocalBan(const char[] banId, const char[] banType, const char[] steamId, const char[] ipAddress, const char[] reason, int expiresAt, bool accountUnbanned, const char[] eventId, int version)
 {
     if (g_AccessSnapshotDb == null)
     {
@@ -1345,16 +1750,30 @@ bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char
         return true;
     }
 
+    char effectiveBanId[128];
+    if (banId[0] != '\0')
+    {
+        strcopy(effectiveBanId, sizeof(effectiveBanId), banId);
+    }
+    else
+    {
+        Format(effectiveBanId, sizeof(effectiveBanId), "legacy:%s:%s", steamId, ipAddress);
+    }
+
+    char escapedBanId[256];
     char escapedSteamId[128];
     char escapedIp[128];
     char escapedReason[512];
+    SQL_EscapeString(g_AccessSnapshotDb, effectiveBanId, escapedBanId, sizeof(escapedBanId));
     SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
     SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIp, sizeof(escapedIp));
     SQL_EscapeString(g_AccessSnapshotDb, reason, escapedReason, sizeof(escapedReason));
 
-    char query[1024];
-    Format(query, sizeof(query), "INSERT OR IGNORE INTO bans (steam_id, ip_address, reason, expires_at) VALUES ('%s', '%s', '%s', %d)",
-        escapedSteamId, escapedIp, escapedReason, expiresAt);
+    char query[1536];
+    Format(query, sizeof(query),
+        "INSERT INTO bans (ban_id, ban_type, steam_id, ip_address, reason, expires_at, account_unbanned) VALUES ('%s', '%s', '%s', '%s', '%s', %d, %d) "
+        ... "ON CONFLICT(ban_id) DO UPDATE SET ban_type = excluded.ban_type, steam_id = excluded.steam_id, ip_address = excluded.ip_address, reason = excluded.reason, expires_at = excluded.expires_at, account_unbanned = excluded.account_unbanned",
+        escapedBanId, banType, escapedSteamId, escapedIp, escapedReason, expiresAt, accountUnbanned ? 1 : 0);
     if (!SQL_FastQuery(g_AccessSnapshotDb, query))
     {
         LogError("[LumiAuth] local ban upsert failed for %s.", steamId);
@@ -1368,7 +1787,25 @@ bool AuthUpsertLocalBan(const char[] steamId, const char[] ipAddress, const char
     return true;
 }
 
-bool AuthRemoveLocalBan(const char[] steamId, const char[] ipAddress, const char[] eventId, int version)
+bool AuthMarkAccountUnbanned(const char[] banId, const char[] steamId)
+{
+    if (g_AccessSnapshotDb == null || banId[0] == '\0')
+    {
+        return false;
+    }
+    char escapedBanId[256];
+    char escapedSteam[128];
+    char query[512];
+    SQL_EscapeString(g_AccessSnapshotDb, banId, escapedBanId, sizeof(escapedBanId));
+    SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
+    Format(query, sizeof(query),
+        "UPDATE bans SET account_unbanned = 1 WHERE ban_id = '%s' AND steam_id = '%s'",
+        escapedBanId, escapedSteam);
+    SQL_FastQuery(g_AccessSnapshotDb, query);
+    return true;
+}
+
+bool AuthRemoveLocalBan(const char[] banId, const char[] steamId, const char[] ipAddress, const char[] eventId, int version)
 {
     if (g_AccessSnapshotDb == null)
     {
@@ -1380,18 +1817,16 @@ bool AuthRemoveLocalBan(const char[] steamId, const char[] ipAddress, const char
         return true;
     }
 
+    char escapedBanId[256];
     char escapedSteam[128];
     char escapedIp[128];
     char condition[512];
     condition[0] = '\0';
 
-    // 优先按 SteamID 精确删除；仅当该行没有 SteamID（纯 IP 封禁）时才按 IP 删除，
-    // 避免误删同 IP 下其他玩家的封禁记录。
-    if (steamId[0] != '\0' && ipAddress[0] != '\0')
+    if (banId[0] != '\0')
     {
-        SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteam, sizeof(escapedSteam));
-        SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIp, sizeof(escapedIp));
-        Format(condition, sizeof(condition), "steam_id = '%s' OR (ip_address = '%s' AND (steam_id = '' OR steam_id IS NULL))", escapedSteam, escapedIp);
+        SQL_EscapeString(g_AccessSnapshotDb, banId, escapedBanId, sizeof(escapedBanId));
+        Format(condition, sizeof(condition), "ban_id = '%s'", escapedBanId);
     }
     else if (steamId[0] != '\0')
     {
@@ -1539,11 +1974,10 @@ void AuthReconcileOnlinePlayers()
         GetClientIP(client, ip, sizeof(ip), true);
 
         char reason[256];
-        if (FindOfflineBan(steamId, ip, reason, sizeof(reason)))
+        bool ipCollision = false;
+        if (FindOfflineBan(steamId, ip, reason, sizeof(reason), ipCollision))
         {
-            LogAccessEvent("kick", "reconcile: banned after resync");
-            MarkClientDisconnect(client, SESSION_REASON_BANNED_KICKED, reason);
-            KickClient(client, "%T", "Kick Banned Message", client, reason);
+            KickForLocalBan(client, steamId, ip, reason, ipCollision);
             continue;
         }
 
@@ -1793,6 +2227,7 @@ bool SaveAccessSnapshot(JSONObject item)
         return false;
     }
 
+
     g_AccessSnapshotBackoffStep = 0;
     g_AccessSnapshotLastRefreshOk = GetTime();
     strcopy(g_AccessSnapshotEtag, sizeof(g_AccessSnapshotEtag), version);
@@ -1868,24 +2303,43 @@ bool SaveSnapshotBans(JSONArray bans)
             continue;
         }
 
+        char banId[64];
+        char banType[16];
         char steamId[64];
         char ipAddress[64];
         char reason[256];
         char expiresAtUnix[32];
+        banId[0] = '\0';
+        banType[0] = '\0';
+        ban.GetString("ban_id", banId, sizeof(banId));
+        ban.GetString("ban_type", banType, sizeof(banType));
         ban.GetString("steam_id", steamId, sizeof(steamId));
         ban.GetString("ip_address", ipAddress, sizeof(ipAddress));
         ban.GetString("reason", reason, sizeof(reason));
         IntToString(LumiJsonGetInt(ban, "expires_at_unix"), expiresAtUnix, sizeof(expiresAtUnix));
+        if (banType[0] == '\0')
+        {
+            strcopy(banType, sizeof(banType), ipAddress[0] != '\0' ? "ip" : "steam");
+        }
+        if (banId[0] == '\0')
+        {
+            Format(banId, sizeof(banId), "legacy:%s:%s", steamId, ipAddress);
+        }
+        bool accountUnbanned = LumiJsonGetBool(ban, "account_unbanned");
 
+        char escapedBanId[256];
         char escapedSteamId[128];
         char escapedIpAddress[128];
         char escapedReason[512];
+        SQL_EscapeString(g_AccessSnapshotDb, banId, escapedBanId, sizeof(escapedBanId));
         SQL_EscapeString(g_AccessSnapshotDb, steamId, escapedSteamId, sizeof(escapedSteamId));
         SQL_EscapeString(g_AccessSnapshotDb, ipAddress, escapedIpAddress, sizeof(escapedIpAddress));
         SQL_EscapeString(g_AccessSnapshotDb, reason, escapedReason, sizeof(escapedReason));
 
-        char query[1024];
-        Format(query, sizeof(query), "INSERT OR IGNORE INTO bans (steam_id, ip_address, reason, expires_at) VALUES ('%s', '%s', '%s', %d)", escapedSteamId, escapedIpAddress, escapedReason, StringToInt(expiresAtUnix));
+        char query[1536];
+        Format(query, sizeof(query),
+            "INSERT OR REPLACE INTO bans (ban_id, ban_type, steam_id, ip_address, reason, expires_at, account_unbanned) VALUES ('%s', '%s', '%s', '%s', '%s', %d, %d)",
+            escapedBanId, banType, escapedSteamId, escapedIpAddress, escapedReason, StringToInt(expiresAtUnix), accountUnbanned ? 1 : 0);
         if (!SQL_FastQuery(g_AccessSnapshotDb, query))
         {
             LogError("[LumiAdmin-Access] access snapshot: bans insert failed at index %d", i);

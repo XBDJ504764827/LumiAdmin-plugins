@@ -188,12 +188,18 @@ void AuthSync_ApplyEvent(const char[] eventId, int version, const char[] eventTy
         return;
     }
 
+    char banId[64];
+    char banType[16];
     char steamId[64];
     char ip[64];
     char reason[256];
+    banId[0] = '\0';
+    banType[0] = '\0';
     steamId[0] = '\0';
     ip[0] = '\0';
     reason[0] = '\0';
+    payload.GetString("ban_id", banId, sizeof(banId));
+    payload.GetString("ban_type", banType, sizeof(banType));
     payload.GetString("steamid64", steamId, sizeof(steamId));
     if (steamId[0] == '\0')
     {
@@ -201,8 +207,14 @@ void AuthSync_ApplyEvent(const char[] eventId, int version, const char[] eventTy
     }
     payload.GetString("ip_address", ip, sizeof(ip));
     payload.GetString("reason", reason, sizeof(reason));
+    bool accountUnbanned = LumiJsonGetBool(payload, "account_unbanned");
+    if (banType[0] == '\0')
+    {
+        // 兼容旧后端（不区分类型）：有 IP 视为 IP 封禁，否则视为 Steam 封禁
+        strcopy(banType, sizeof(banType), ip[0] != '\0' ? "ip" : "steam");
+    }
 
-    if (StrEqual(eventType, "ban.add"))
+    if (StrEqual(eventType, "ban.add") || StrEqual(eventType, "ban.update"))
     {
         // 后端直接下发 unix 时间戳，避免插件解析 RFC3339；缺失时按永久处理，
         // 下一次快照会带回精确值。
@@ -211,18 +223,31 @@ void AuthSync_ApplyEvent(const char[] eventId, int version, const char[] eventTy
         {
             strcopy(reason, sizeof(reason), "封禁");
         }
-        if (AuthUpsertLocalBan(steamId, ip, reason, expiresAt, eventId, version))
+        if (AuthUpsertLocalBan(banId, banType, steamId, ip, reason, expiresAt, accountUnbanned, eventId, version))
         {
             LogMessage("[LumiAuth] Applying event %d (%s).", version, eventType);
             LogAccessEvent("event", eventType);
-            AuthSync_KickIfOnline(steamId, ip, reason);
+            if (StrEqual(eventType, "ban.add"))
+            {
+                AuthSync_KickIfOnline(steamId, ip, reason, banType);
+            }
             LogMessage("[LumiAuth] Applied event %d.", version);
         }
     }
     else if (StrEqual(eventType, "ban.remove"))
     {
-        if (AuthRemoveLocalBan(steamId, ip, eventId, version))
+        if (AuthRemoveLocalBan(banId, steamId, ip, eventId, version))
         {
+            LogMessage("[LumiAuth] Applying event %d (%s).", version, eventType);
+            LogAccessEvent("event", eventType);
+            LogMessage("[LumiAuth] Applied event %d.", version);
+        }
+    }
+    else if (StrEqual(eventType, "ban.exempt"))
+    {
+        if (AuthMarkAccountUnbanned(banId, steamId))
+        {
+            AuthMarkEventApplied(eventId, version);
             LogMessage("[LumiAuth] Applying event %d (%s).", version, eventType);
             LogAccessEvent("event", eventType);
             LogMessage("[LumiAuth] Applied event %d.", version);
@@ -265,7 +290,7 @@ void AuthSync_ApplyEvent(const char[] eventId, int version, const char[] eventTy
 /**
  * 新 ban 落地后若玩家正在服内，立即补踢（封禁实时性）。
  */
-void AuthSync_KickIfOnline(const char[] steamId, const char[] ip, const char[] reason)
+void AuthSync_KickIfOnline(const char[] steamId, const char[] ip, const char[] reason, const char[] banType)
 {
     for (int client = 1; client <= MaxClients; client++)
     {
@@ -283,11 +308,12 @@ void AuthSync_KickIfOnline(const char[] steamId, const char[] ip, const char[] r
         GetClientIP(client, clientIp, sizeof(clientIp), true);
 
         bool hit = false;
+        // Steam 封禁只踢目标账号；IP 封禁额外踢同 IP 的在线玩家（连坐）
         if (steamId[0] != '\0' && StrEqual(clientSteam, steamId, false))
         {
             hit = true;
         }
-        else if (ip[0] != '\0' && StrEqual(clientIp, ip, false))
+        else if (StrEqual(banType, "ip") && ip[0] != '\0' && StrEqual(clientIp, ip, false))
         {
             hit = true;
         }
@@ -423,11 +449,21 @@ Action CommandApplyBanFastPath(int args)
     char steamId[64];
     char expiresText[32];
     char reason[256];
+    char banType[16];
+    char ipAddress[64];
+    banType[0] = '\0';
+    ipAddress[0] = '\0';
     GetCmdArg(1, banId, sizeof(banId));
     GetCmdArg(2, versionText, sizeof(versionText));
     GetCmdArg(3, steamId, sizeof(steamId));
     GetCmdArg(4, expiresText, sizeof(expiresText));
     GetCmdArg(5, reason, sizeof(reason));
+    GetCmdArg(6, banType, sizeof(banType));
+    GetCmdArg(7, ipAddress, sizeof(ipAddress));
+    if (banType[0] == '\0')
+    {
+        strcopy(banType, sizeof(banType), ipAddress[0] != '\0' ? "ip" : "steam");
+    }
 
     int version = StringToInt(versionText);
     int expiresAt = StringToInt(expiresText);
@@ -436,17 +472,17 @@ Action CommandApplyBanFastPath(int args)
     char eventId[128];
     // 与解封快车道使用不同的幂等键，否则解封会命中「已应用」而跳过删除。
     Format(eventId, sizeof(eventId), "fastpath:ban:%s", banId);
-    if (!AuthUpsertLocalBan(steamId, "", reason, expiresAt, eventId, version))
+    if (!AuthUpsertLocalBan(banId, banType, steamId, ipAddress, reason, expiresAt, false, eventId, version))
     {
         LogError("[LumiAuth] lumiadmin_apply_ban: local persist failed for %s.", steamId);
         return Plugin_Handled;
     }
     // 注意：这里不推进事件游标、也不 ACK。快车道只负责「先落本地 + 先踢」，
     // 真正的 ban.add 事件仍由 poll 按顺序应用并 ACK，避免跳过中间事件。
-    LogMessage("[LumiAuth] Fast-path ban persisted for %s (event version %d).", steamId, version);
+    LogMessage("[LumiAuth] Fast-path ban persisted for %s (type %s, event version %d).", steamId, banType, version);
 
     // 2) 再 Kick 在服命中者（此时重连必被本地拦，竞态关闭）
-    AuthSync_KickIfOnline(steamId, "", reason);
+    AuthSync_KickIfOnline(steamId, ipAddress, reason, banType);
     return Plugin_Handled;
 }
 
@@ -461,21 +497,42 @@ Action CommandApplyUnbanFastPath(int args)
     char banId[64];
     char versionText[16];
     char steamId[64];
+    char ipAddress[64];
+    ipAddress[0] = '\0';
     GetCmdArg(1, banId, sizeof(banId));
     GetCmdArg(2, versionText, sizeof(versionText));
     GetCmdArg(3, steamId, sizeof(steamId));
+    GetCmdArg(4, ipAddress, sizeof(ipAddress));
 
     int version = StringToInt(versionText);
     char eventId[128];
     // 与封禁快车道区分，避免 AuthEventAlreadyApplied 命中后跳过删除。
     Format(eventId, sizeof(eventId), "fastpath:unban:%s", banId);
-    AuthRemoveLocalBan(steamId, "", eventId, version);
+    AuthRemoveLocalBan(banId, steamId, ipAddress, eventId, version);
     if (version > 0)
     {
         AuthPersistAppliedVersion(version);
         AuthSync_Ack(version);
     }
     LogMessage("[LumiAuth] Fast-path unban applied for %s.", steamId);
+    return Plugin_Handled;
+}
+
+Action CommandApplyAccountUnbanFastPath(int args)
+{
+    if (args < 2)
+    {
+        LogError("[LumiAuth] lumiadmin_apply_account_unban: bad args (%d).", args);
+        return Plugin_Handled;
+    }
+
+    char banId[64];
+    char steamId[64];
+    GetCmdArg(1, banId, sizeof(banId));
+    GetCmdArg(2, steamId, sizeof(steamId));
+
+    AuthMarkAccountUnbanned(banId, steamId);
+    LogMessage("[LumiAuth] Fast-path account unban applied for %s (ban %s).", steamId, banId);
     return Plugin_Handled;
 }
 
