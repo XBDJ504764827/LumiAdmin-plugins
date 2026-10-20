@@ -39,9 +39,14 @@ public void OnClientAuthorized(int client, const char[] auth)
     if (client > 0 && client <= MaxClients)
     {
         g_AccessMissingDeferred[client] = 0;
+        g_AccessProfilePending[client] = 0;
+        g_AccessProfileAttempts[client] = 0;
+        g_AccessLivePending[client] = 0;
+        g_AccessLiveAttempts[client] = 0;
     }
-    // 本地同步裁决：零网络等待（资料未验证除外：先放行并延迟复核，见下）。
-    LocalAccessDecide(client);
+
+    // 网站实时裁决为主：允许玩家先加载地图，5 秒内出结果；网站不可达/超时才回退本地快照。
+    StartLiveAccessCheck(client);
 }
 
 /**
@@ -51,6 +56,261 @@ public void OnClientAuthorized(int client, const char[] auth)
 void LocalAccessDecide(int client)
 {
     LocalAccessFallback(client);
+}
+
+/**
+ * 网站实时裁决：POST /api/plugin/access/check。
+ * 插件不阻塞进服；结果到达前玩家可以继续加载地图。
+ */
+void StartLiveAccessCheck(int client)
+{
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return;
+    }
+
+    char steamId[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        LocalAccessDecide(client);
+        return;
+    }
+
+    char url[512];
+    char token[256];
+    if (!ResolvePluginApiConfig(url, sizeof(url), "/access/check", token, sizeof(token)))
+    {
+        LocalAccessDecide(client);
+        return;
+    }
+
+    int currentPort = 0;
+    if (!GetCurrentServerPort(currentPort))
+    {
+        LocalAccessDecide(client);
+        return;
+    }
+
+    char ipAddress[64];
+    char playerName[128];
+    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+    GetClientName(client, playerName, sizeof(playerName));
+
+    JSONObject payload = new JSONObject();
+    payload.SetString("report_token", token);
+    payload.SetInt("port", currentPort);
+    payload.SetInt("server_port", currentPort);
+    payload.SetString("steam_id64", steamId);
+    payload.SetString("ip_address", ipAddress);
+    payload.SetString("player", playerName);
+
+    g_AccessLivePending[client] = 1;
+    g_AccessLiveAttempts[client]++;
+
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamId);
+
+    float profileTimeout = g_AccessProfileTimeout != null ? g_AccessProfileTimeout.FloatValue : 20.0;
+    if (!PostJsonObject(url, payload, OnLiveAccessResponse, pack, profileTimeout))
+    {
+        g_AccessLivePending[client] = 0;
+        delete pack;
+        LocalAccessDecide(client);
+    }
+    delete payload;
+}
+
+void ClearAccessVerifyTimer(int client)
+{
+    if (client > 0 && client <= MaxClients && g_AccessProfileVerifyTimer[client] != null)
+    {
+        KillTimer(g_AccessProfileVerifyTimer[client]);
+        g_AccessProfileVerifyTimer[client] = null;
+    }
+}
+
+public void OnLiveAccessResponse(HTTPResponse response, any value, const char[] error)
+{
+    DataPack pack = view_as<DataPack>(value);
+    int userid = 0;
+    char steamId[64];
+    steamId[0] = '\0';
+    if (pack != null)
+    {
+        pack.Reset();
+        userid = pack.ReadCell();
+        pack.ReadString(steamId, sizeof(steamId));
+        delete pack;
+    }
+
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return;
+    }
+
+    if (error[0] != '\0' || response.Status != HTTPStatus_OK)
+    {
+        LogHttpPostFailure("live access check", response, error);
+        if (g_AccessLivePending[client] && g_AccessLiveAttempts[client] < 3)
+        {
+            CreateTimer(1.0, Timer_RetryLiveAccess, userid, TIMER_FLAG_NO_MAPCHANGE);
+        }
+        return;
+    }
+
+    JSONObject root = view_as<JSONObject>(response.Data);
+    if (root == null)
+    {
+        return;
+    }
+    JSONObject result = view_as<JSONObject>(root.Get("result"));
+    if (result == null)
+    {
+        delete root;
+        return;
+    }
+
+    bool allowed = LumiJsonGetBool(result, "allowed");
+    char message[512];
+    char failureCode[48];
+    message[0] = '\0';
+    failureCode[0] = '\0';
+    result.GetString("message", message, sizeof(message));
+    result.GetString("failure_code", failureCode, sizeof(failureCode));
+
+    bool hasRating = result.HasKey("rating") && !result.IsNull("rating");
+    bool hasSteamLevel = result.HasKey("steam_level") && !result.IsNull("steam_level");
+    int rating = hasRating ? LumiJsonGetInt(result, "rating") : 0;
+    int steamLevel = hasSteamLevel ? LumiJsonGetInt(result, "steam_level") : 0;
+    delete result;
+    delete root;
+
+    g_AccessLivePending[client] = 0;
+    ClearAccessVerifyTimer(client);
+
+    if (allowed)
+    {
+        LogAccessEvent("allow", "live access check");
+        if (hasRating && hasSteamLevel)
+        {
+            // 写入本地资料，供网站断联时兜底
+            UpsertAccessProfile(steamId, rating, steamLevel, GetTime() + 86400);
+        }
+        return;
+    }
+
+    // 网站重试后仍拿不到资料：回退本地已缓存资料/快照做最终裁决。
+    if (StrEqual(failureCode, "profile_fetch_failed") || StrEqual(failureCode, "profile_missing"))
+    {
+        LogAccessEvent("fallback", "live profile unavailable, use local snapshot");
+        FinalizeAccessFromSnapshot(client, true, true);
+        return;
+    }
+
+    if (message[0] == '\0')
+    {
+        strcopy(message, sizeof(message), "你无法进入该服务器。");
+    }
+    LogAccessEvent("kick", "live access denied");
+    MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
+    KickClient(client, "%s", message);
+}
+
+public Action Timer_RetryLiveAccess(Handle timer, int userid)
+{
+    int client = GetClientOfUserId(userid);
+    if (client <= 0 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
+    {
+        return Plugin_Stop;
+    }
+    if (!g_AccessLivePending[client] || g_AccessLiveAttempts[client] >= 3)
+    {
+        return Plugin_Stop;
+    }
+    LogAccessEvent("access", "retry live access check");
+    StartLiveAccessCheck(client);
+    return Plugin_Stop;
+}
+
+/**
+ * 本地快照最终裁决（网站不可达或实时裁决明确返回资料不可用）。
+ * 不再发起任何实时点查，避免重复等待；未验证资料直接按 profile_missing 处理。
+ */
+void FinalizeAccessFromSnapshot(int client, bool kickOnMissing, bool report)
+{
+    char steamId[64];
+    char ipAddress[64];
+    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    {
+        return;
+    }
+    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
+
+    char reason[256];
+    bool ipCollision = false;
+    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
+    {
+        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
+        return;
+    }
+
+    char allowMethod[32];
+    char denyMethod[32];
+    char denyFailureCode[48];
+    char denyReason[256];
+    LocalRuleDecision decision = OfflineEvaluateRules(steamId, ipAddress, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
+    if (decision == LocalRule_Allow)
+    {
+        LogAccessEvent("allow", "snapshot final");
+        if (report)
+        {
+            ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
+        }
+        return;
+    }
+    if (decision == LocalRule_Deny)
+    {
+        if (!kickOnMissing && IsGraceableRestrictionDeny(denyFailureCode))
+        {
+            return;
+        }
+        char message[256];
+        if (StrEqual(denyFailureCode, "profile_missing"))
+        {
+            strcopy(message, sizeof(message), "无法验证你的 Rating / Steam 等级，请稍后重试。");
+        }
+        else
+        {
+            strcopy(message, sizeof(message), denyReason);
+        }
+        LogAccessEvent("kick", "snapshot final deny");
+        if (report)
+        {
+            ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, message);
+        }
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
+        KickClient(client, "%s", message);
+        return;
+    }
+
+    if (!ShouldFailOpenAccessCheck())
+    {
+        LogAccessEvent("kick", "snapshot final: rules unavailable, fail_closed");
+        if (report)
+        {
+            ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
+        }
+        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
+        KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
+        return;
+    }
+    LogAccessEvent("allow", "snapshot final: rules unavailable, fail_open");
+    if (report)
+    {
+        ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
+    }
 }
 
 /**
@@ -338,67 +598,22 @@ public Action Timer_AccessProfileVerify(Handle timer, int userid)
         return Plugin_Stop;
     }
     g_AccessProfileVerifyTimer[client] = null;
-    if (!g_AccessProfilePending[client])
-    {
-        return Plugin_Stop;
-    }
-    g_AccessProfilePending[client] = 0;
 
-    char steamId[64];
-    char ipAddress[64];
-    if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId), true))
+    if (g_AccessLivePending[client])
     {
-        return Plugin_Stop;
-    }
-    GetClientIP(client, ipAddress, sizeof(ipAddress), true);
-
-    char reason[256];
-    bool ipCollision = false;
-    if (FindOfflineBan(steamId, ipAddress, reason, sizeof(reason), ipCollision))
-    {
-        KickForLocalBan(client, steamId, ipAddress, reason, ipCollision);
+        g_AccessLivePending[client] = 0;
+        LogAccessEvent("fallback", "live access check timeout, use local snapshot");
+        FinalizeAccessFromSnapshot(client, true, true);
         return Plugin_Stop;
     }
 
-    char allowMethod[32];
-    char denyMethod[32];
-    char denyFailureCode[48];
-    char denyReason[256];
-    LocalRuleDecision decision = OfflineEvaluateRules(steamId, ipAddress, allowMethod, sizeof(allowMethod), denyMethod, sizeof(denyMethod), denyFailureCode, sizeof(denyFailureCode), denyReason, sizeof(denyReason));
-    if (decision == LocalRule_Allow)
+    if (g_AccessProfilePending[client])
     {
-        LogAccessEvent("allow", "profile verified before kick");
-        ReportAccessDecision(client, steamId, ipAddress, true, allowMethod, "", "");
-        return Plugin_Stop;
-    }
-    if (decision == LocalRule_Deny)
-    {
-        char message[256];
-        if (StrEqual(denyFailureCode, "profile_missing"))
-        {
-            strcopy(message, sizeof(message), "无法验证你的 Rating / Steam 等级，请稍后重试。");
-        }
-        else
-        {
-            strcopy(message, sizeof(message), denyReason);
-        }
-        LogAccessEvent("kick", "profile verify timeout");
-        ReportAccessDecision(client, steamId, ipAddress, false, denyMethod, denyFailureCode, message);
-        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, message);
-        KickClient(client, "%s", message);
+        g_AccessProfilePending[client] = 0;
+        FinalizeAccessFromSnapshot(client, true, true);
         return Plugin_Stop;
     }
 
-    if (!ShouldFailOpenAccessCheck())
-    {
-        LogAccessEvent("kick", "profile verify: rules unavailable, fail_closed");
-        ReportAccessDecision(client, steamId, ipAddress, false, "snapshot_fallback", "rules_unavailable", "本地访问快照未确认玩家满足进入条件。");
-        MarkClientDisconnect(client, SESSION_REASON_ACCESS_REJECTED, "本地访问快照未确认玩家满足进入条件。");
-        KickClient(client, "%T", "Access Whitelist Unconfirmed", client);
-        return Plugin_Stop;
-    }
-    LogAccessEvent("allow", "profile verify: rules unavailable, fail_open");
-    ReportAccessDecision(client, steamId, ipAddress, true, "unrestricted", "", "");
     return Plugin_Stop;
 }
 

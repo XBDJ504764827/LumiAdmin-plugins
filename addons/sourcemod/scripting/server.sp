@@ -92,6 +92,9 @@ bool g_AccessBansSchemaUpgraded = false;
 int g_AccessProfilePending[MAXPLAYERS + 1];
 int g_AccessProfileAttempts[MAXPLAYERS + 1];
 Handle g_AccessProfileVerifyTimer[MAXPLAYERS + 1];
+// 网站实时裁决（/access/check）：优先网站，超时/不可达才回退快照
+int g_AccessLivePending[MAXPLAYERS + 1];
+int g_AccessLiveAttempts[MAXPLAYERS + 1];
 
 // ban poll 失败退避状态（L10）
 int g_BanPollBackoffStep = 0;
@@ -113,7 +116,7 @@ public Plugin myinfo =
     name = "LumiAdmin Server",
     author = "LumiAdmin",
     description = "Reports CS:GO online players and server status to LumiAdmin, enforces bans and access control.",
-    version = "1.3.0",
+    version = "1.4.0",
     url = ""
 };
 
@@ -178,7 +181,7 @@ public void OnClientPostAdminCheck(int client)
     {
         return;
     }
-    if (!g_AccessProfilePending[client])
+    if (!g_AccessProfilePending[client] && !g_AccessLivePending[client])
     {
         return;
     }
